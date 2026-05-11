@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Env / secrets
+.env
+.env.local
+*.local
+service-account*.json
+sa.json
+sa-*.json
+credentials*.json
+
+# Docker / runtime
+docker-compose.override.yml
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Build outputs / tmp
+*.log
+*.mp4
+*.mp3
+*.wav
+*.webm
+*.mov
+tmp/
+output/

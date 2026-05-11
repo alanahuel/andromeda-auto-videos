@@ -1,0 +1,25 @@
+# Copy to docker-compose.override.yml for local development.
+# `docker compose` automatically merges this on top of docker-compose.yml.
+
+services:
+  api:
+    # Mount source so edits hot-reload (uvicorn --reload).
+    volumes:
+      - ./api/src:/app/src
+      - ./shared:/app/shared
+    command:
+      [
+        "uv", "run", "uvicorn",
+        "src.main:app",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--reload",
+      ]
+
+  worker:
+    volumes:
+      - ./worker/src:/app/src
+      - ./shared:/app/shared
+      # Bind-mount your local Service Account JSON for dev.
+      # Then set GOOGLE_SERVICE_ACCOUNT_JSON=/secrets/sa.json in your .env
+      - ./sa.json:/secrets/sa.json:ro

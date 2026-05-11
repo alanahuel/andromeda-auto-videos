@@ -1,0 +1,28 @@
+[project]
+name = "render-worker"
+version = "0.1.0"
+description = "Andromeda render-service — RQ worker that downloads clips, runs ffmpeg, uploads to Drive, and callbacks Make."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6,<3.0",
+    "redis>=5.1,<6.0",
+    "rq>=1.16,<2.0",
+    "structlog>=24.4,<26.0",
+    "httpx>=0.27,<1.0",
+    "google-api-python-client>=2.149,<3.0",
+    "google-auth>=2.35,<3.0",
+    "google-auth-httplib2>=0.2,<1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = [".", "../shared/.."]
+testpaths = ["tests"]
