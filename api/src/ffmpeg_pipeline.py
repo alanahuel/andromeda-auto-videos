@@ -1,9 +1,13 @@
-"""FFmpeg / ffprobe wrappers.
+"""FFmpeg pipeline: probe, concat (fast or re-encode), mix music.
 
-Pure command-builders return argv lists; runners execute them with
-subprocess.run. Errors raise FfmpegError with a user-readable message;
-the full stderr is logged separately. This shape keeps the builders
-unit-testable without spawning ffmpeg.
+Pure command-builders return argv lists; the runners (`probe`, `run`) are
+the only functions that shell out — so the builders stay unit-testable
+without spawning ffmpeg.
+
+`run_pipeline()` is the synchronous entry point. It is intended to be
+called from a worker thread (the API uses `asyncio.to_thread`). Known
+failures raise `_FriendlyError` whose message is safe to surface to
+Make/Airtable in Spanish.
 """
 from __future__ import annotations
 
@@ -12,11 +16,20 @@ import logging
 import os
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
+
+from shared.models import JobParams
 
 from .settings import get_settings
 
 logger = logging.getLogger(__name__)
+
+FFMPEG_TIMEOUT_SECONDS = 600
+
+
+class _FriendlyError(RuntimeError):
+    """Internal sentinel — message is safe to surface to Make/Airtable."""
 
 
 class FfmpegError(RuntimeError):
@@ -35,7 +48,7 @@ class VideoInfo:
     height: int
     fps: float
     vcodec: str
-    acodec: str | None  # None if no audio stream
+    acodec: str | None
     sample_rate: int | None
     duration: float
 
@@ -109,12 +122,6 @@ def probe(path: str) -> VideoInfo:
     )
 
 
-def probe_duration(path: str) -> float:
-    """Light-weight duration probe used after concat."""
-    info = probe(path)
-    return info.duration
-
-
 # ---------------------------------------------------------------------------
 # Compatibility check for the fast-path
 # ---------------------------------------------------------------------------
@@ -156,11 +163,9 @@ _TARGET_DIMS = {
 
 
 def build_concat_list_file(workdir: str, clip_paths: list[str]) -> str:
-    """Write the concat demuxer's list file and return its path."""
     list_path = os.path.join(workdir, "concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as fh:
         for p in clip_paths:
-            # Escape single quotes per concat-demuxer rules: ' → '\''
             escaped = p.replace("'", "'\\''")
             fh.write(f"file '{escaped}'\n")
     return list_path
@@ -183,12 +188,9 @@ def _per_clip_video_filter(
     target_orientation: Literal["vertical", "horizontal"],
     strategy: Literal["crop", "pad"],
 ) -> str:
-    """Per-clip video filter that takes any source aspect and produces the target frame."""
     w, h = _TARGET_DIMS[target_orientation]
     if strategy == "crop":
-        # Scale so the source fills the target, then crop the overflow centered.
         return f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps=30"
-    # pad / letterbox
     return (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30"
@@ -201,20 +203,17 @@ def build_concat_reencode_cmd(
     target_orientation: Literal["vertical", "horizontal"],
     strategy: Literal["crop", "pad"],
 ) -> list[str]:
-    """Build the normalised re-encode + concat command.
-
-    For each clip that has no audio stream we add an extra `-f lavfi -t DUR -i anullsrc`
-    input and consume its audio in the filter graph, so the concat filter always
-    sees 3 audio streams.
+    """Normalised re-encode + concat. Per-clip silent lavfi audio is injected
+    when a clip has no audio stream, so the `concat=` filter always sees 3
+    video+audio pairs.
     """
     if len(infos) != 3:
         raise ValueError("expected exactly 3 clips for concat")
 
     cmd: list[str] = ["ffmpeg", "-y"]
-    # Real inputs first — their indices match infos[i].
     for info in infos:
         cmd += ["-i", info.path]
-    # For each silent clip, append a lavfi input of matching duration.
+
     silent_input_for: dict[int, int] = {}
     next_input_idx = len(infos)
     for i, info in enumerate(infos):
@@ -267,10 +266,10 @@ def build_music_mix_cmd(
     fade_out: float,
     concat_has_audio: bool,
 ) -> list[str]:
-    """Mix the concat with background music. Music is truncated by amix=duration=first.
+    """Mix concat with background music. Music is truncated by amix=duration=first.
 
-    If the concat has no audio (extremely rare — all three sources silent), we
-    map only the music as the audio track of the output.
+    If the concat has no audio (all three sources silent), the music alone
+    becomes the audio track of the output.
     """
     fade_out_start = max(0.0, duration - fade_out)
     if concat_has_audio:
@@ -310,19 +309,10 @@ def build_music_mix_cmd(
 
 
 def run(cmd: list[str], *, friendly_action: str, timeout: int | None = None) -> None:
-    """Run an ffmpeg command. On non-zero exit or timeout, raise FfmpegError.
-
-    `friendly_action` is interpolated into the user-facing error message
-    (e.g. "concatenar los clips"). The full stderr is logged but never
-    returned to the caller.
-    """
-    settings = get_settings()
-    t = timeout if timeout is not None else settings.ffmpeg_timeout_seconds
+    t = timeout if timeout is not None else FFMPEG_TIMEOUT_SECONDS
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=t)
     except subprocess.TimeoutExpired as exc:
-        # subprocess.run with timeout has already sent SIGKILL by the time
-        # TimeoutExpired is raised.
         logger.error("ffmpeg_timeout", extra={"action": friendly_action, "cmd": cmd[:3]})
         raise FfmpegError(
             f"FFmpeg colgado al {friendly_action} (timeout {t}s). "
@@ -339,6 +329,102 @@ def run(cmd: list[str], *, friendly_action: str, timeout: int | None = None) -> 
             },
         )
         raise FfmpegError(
-            f"FFmpeg falló al {friendly_action}. Revisa los logs del worker para "
-            f"el detalle técnico."
+            f"FFmpeg falló al {friendly_action}. Revisa los logs para el detalle técnico."
         )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline orchestrator
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PipelineResult:
+    duration_seconds: float
+    concat_strategy: Literal["fast", "reencode"]
+
+
+def run_pipeline(
+    *,
+    hook: Path,
+    cuerpo: Path,
+    cta: Path,
+    music: Path,
+    output: Path,
+    params: JobParams,
+) -> PipelineResult:
+    """Probe → concat (fast or re-encode) → mix music → write output.
+
+    Synchronous and CPU-bound. Call from a worker thread.
+    Known failures raise `_FriendlyError` (Spanish, safe to surface).
+    """
+    import structlog
+
+    log = structlog.get_logger("render-pipeline")
+    settings = get_settings()
+    workdir = output.parent
+
+    # ---- 1. Probe clips in role order: hook → cuerpo → cta ----
+    ordered_paths = [str(hook), str(cuerpo), str(cta)]
+    try:
+        infos = [probe(p) for p in ordered_paths]
+    except FfmpegError as exc:
+        raise _FriendlyError(str(exc)) from exc
+
+    # ---- 2. Concat ----
+    concat_path = workdir / "concat.mp4"
+    orientation = params.orientation
+
+    if can_concat_without_reencode(infos, orientation):
+        log.info("concat_fast_path")
+        list_path = build_concat_list_file(str(workdir), ordered_paths)
+        cmd = build_concat_copy_cmd(list_path, str(concat_path))
+        try:
+            run(cmd, friendly_action="concatenar los clips")
+        except FfmpegError as exc:
+            raise _FriendlyError(str(exc)) from exc
+        concat_strategy: Literal["fast", "reencode"] = "fast"
+    else:
+        log.info("concat_reencode_path", strategy=settings.orientation_strategy)
+        cmd = build_concat_reencode_cmd(
+            infos,
+            output_path=str(concat_path),
+            target_orientation=orientation,
+            strategy=settings.orientation_strategy,
+        )
+        try:
+            run(cmd, friendly_action="normalizar y concatenar los clips")
+        except FfmpegError as exc:
+            raise _FriendlyError(str(exc)) from exc
+        concat_strategy = "reencode"
+
+    # ---- 3. Probe concat for duration + audio presence ----
+    try:
+        concat_info = probe(str(concat_path))
+    except FfmpegError as exc:
+        raise _FriendlyError(
+            f"No pude leer el vídeo concatenado para calcular su duración — {exc}"
+        ) from exc
+    duration = concat_info.duration
+    if duration <= 0:
+        raise _FriendlyError(
+            "El vídeo concatenado tiene duración 0 — uno de los clips está vacío."
+        )
+
+    # ---- 4. Mix music ----
+    mix_cmd = build_music_mix_cmd(
+        concat_path=str(concat_path),
+        music_path=str(music),
+        output_path=str(output),
+        duration=duration,
+        volume=params.music_volume,
+        fade_in=params.fade_in,
+        fade_out=params.fade_out,
+        concat_has_audio=concat_info.has_audio,
+    )
+    try:
+        run(mix_cmd, friendly_action="mezclar la música con el vídeo")
+    except FfmpegError as exc:
+        raise _FriendlyError(str(exc)) from exc
+
+    return PipelineResult(duration_seconds=round(duration, 2), concat_strategy=concat_strategy)

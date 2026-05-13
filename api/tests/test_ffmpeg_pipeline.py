@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 import pytest
 
-from src import ffmpeg_runner
-from src.ffmpeg_runner import (
+from src import ffmpeg_pipeline
+from src.ffmpeg_pipeline import (
     FfmpegError,
     VideoInfo,
     build_concat_copy_cmd,
@@ -66,7 +66,6 @@ def test_concat_fastpath_rejected_when_codecs_differ():
 
 def test_concat_fastpath_rejected_when_fps_differs():
     infos = [_info(fps=30.0), _info(fps=29.97), _info(fps=30.0)]
-    # 29.97 vs 30 diverges by >0.01, so reject.
     assert can_concat_without_reencode(infos, "vertical") is False
 
 
@@ -87,7 +86,7 @@ def test_build_ffprobe_cmd_shape():
     assert cmd[-1] == "/tmp/foo.mp4"
 
 
-def test_probe_parses_streams_and_format(monkeypatch):
+def test_probe_parses_streams_and_format():
     fake = {
         "format": {"duration": "12.5"},
         "streams": [
@@ -106,7 +105,7 @@ def test_probe_parses_streams_and_format(monkeypatch):
         ],
     }
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(fake), stderr="")
-    with patch("src.ffmpeg_runner.subprocess.run", return_value=completed):
+    with patch("src.ffmpeg_pipeline.subprocess.run", return_value=completed):
         info = probe("/tmp/x.mp4")
     assert info.width == 1080 and info.height == 1920
     assert info.vcodec == "h264" and info.acodec == "aac"
@@ -116,7 +115,7 @@ def test_probe_parses_streams_and_format(monkeypatch):
     assert info.orientation == "vertical"
 
 
-def test_probe_no_audio_stream(monkeypatch):
+def test_probe_no_audio_stream():
     fake = {
         "format": {"duration": "8"},
         "streams": [
@@ -130,7 +129,7 @@ def test_probe_no_audio_stream(monkeypatch):
         ],
     }
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(fake), stderr="")
-    with patch("src.ffmpeg_runner.subprocess.run", return_value=completed):
+    with patch("src.ffmpeg_pipeline.subprocess.run", return_value=completed):
         info = probe("/tmp/silent.mp4")
     assert info.has_audio is False
     assert info.acodec is None
@@ -138,9 +137,9 @@ def test_probe_no_audio_stream(monkeypatch):
     assert info.fps == pytest.approx(30000 / 1001)
 
 
-def test_probe_raises_friendly_error_when_ffprobe_fails(monkeypatch):
+def test_probe_raises_friendly_error_when_ffprobe_fails():
     err = subprocess.CalledProcessError(returncode=1, cmd=["ffprobe"], stderr="broken")
-    with patch("src.ffmpeg_runner.subprocess.run", side_effect=err):
+    with patch("src.ffmpeg_pipeline.subprocess.run", side_effect=err):
         with pytest.raises(FfmpegError) as exc:
             probe("/tmp/x.mp4")
     assert "corrupto" in str(exc.value) or "no es compatible" in str(exc.value)
@@ -172,7 +171,6 @@ def test_build_concat_copy_cmd_uses_concat_demuxer_and_copy():
     assert "-safe" in cmd and cmd[cmd.index("-safe") + 1] == "0"
     assert "-c" in cmd and "copy" in cmd
     assert cmd[-1] == "/tmp/out.mp4"
-    # +faststart is important so Drive previews play immediately.
     assert "+faststart" in cmd
 
 
@@ -187,7 +185,6 @@ def test_concat_reencode_vertical_crop_filter_present():
     fc = cmd[cmd.index("-filter_complex") + 1]
     assert "scale=1080:1920:force_original_aspect_ratio=increase" in fc
     assert "crop=1080:1920" in fc
-    # 3 video filters + 3 audio + 1 concat = 7 parts joined by ';'
     assert fc.count("concat=n=3:v=1:a=1") == 1
 
 
@@ -211,12 +208,10 @@ def test_concat_reencode_libx264_aac_profile():
 def test_concat_reencode_adds_silent_lavfi_for_clip_without_audio():
     infos = [_info(acodec=None, sr=None, duration=5.0), _info(), _info()]
     cmd = build_concat_reencode_cmd(infos, "/tmp/out.mp4", "vertical", "crop")
-    # The 3 real inputs are 0,1,2; the lavfi silent input is then index 3.
     lavfi_pos = cmd.index("-f")
     assert cmd[lavfi_pos + 1] == "lavfi"
     assert "anullsrc=channel_layout=stereo:sample_rate=48000" in cmd
     fc = cmd[cmd.index("-filter_complex") + 1]
-    # First clip's audio should map from the silent lavfi input (index 3).
     assert "[3:a]aresample=48000" in fc
 
 
@@ -244,10 +239,8 @@ def test_music_mix_cmd_uses_amix_and_correct_fade_timing():
     fc = cmd[cmd.index("-filter_complex") + 1]
     assert "volume=0.3" in fc
     assert "afade=t=in:st=0:d=2.0" in fc
-    # fade_out_start = duration - fade_out = 88.000
     assert "afade=t=out:st=88.000:d=2.0" in fc
     assert "amix=inputs=2:duration=first" in fc
-    # Video is just copied through — never re-encoded at this stage.
     assert "-c:v" in cmd and "copy" in cmd[cmd.index("-c:v") + 1 : cmd.index("-c:v") + 2]
 
 
@@ -263,9 +256,7 @@ def test_music_mix_cmd_when_concat_has_no_audio_maps_only_music():
         concat_has_audio=False,
     )
     fc = cmd[cmd.index("-filter_complex") + 1]
-    # amix is not used because there's only one audio source.
     assert "amix=" not in fc
-    # The music is trimmed to the video duration.
     assert "atrim=0:10.000" in fc
 
 
@@ -277,7 +268,7 @@ def test_music_mix_fade_out_start_clamped_to_zero_for_short_video():
         duration=1.0,
         volume=0.5,
         fade_in=2.0,
-        fade_out=5.0,  # longer than the video
+        fade_out=5.0,
         concat_has_audio=True,
     )
     fc = cmd[cmd.index("-filter_complex") + 1]
@@ -291,15 +282,15 @@ def test_music_mix_fade_out_start_clamped_to_zero_for_short_video():
 
 def test_run_raises_friendly_error_on_non_zero_exit():
     completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="bad input")
-    with patch("src.ffmpeg_runner.subprocess.run", return_value=completed):
+    with patch("src.ffmpeg_pipeline.subprocess.run", return_value=completed):
         with pytest.raises(FfmpegError) as exc:
-            ffmpeg_runner.run(["ffmpeg", "-i", "x"], friendly_action="concatenar los clips")
+            ffmpeg_pipeline.run(["ffmpeg", "-i", "x"], friendly_action="concatenar los clips")
     assert "concatenar los clips" in str(exc.value)
 
 
 def test_run_raises_friendly_error_on_timeout():
     err = subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=1)
-    with patch("src.ffmpeg_runner.subprocess.run", side_effect=err):
+    with patch("src.ffmpeg_pipeline.subprocess.run", side_effect=err):
         with pytest.raises(FfmpegError) as exc:
-            ffmpeg_runner.run(["ffmpeg", "-i", "x"], friendly_action="concatenar", timeout=1)
+            ffmpeg_pipeline.run(["ffmpeg", "-i", "x"], friendly_action="concatenar", timeout=1)
     assert "colgado" in str(exc.value)

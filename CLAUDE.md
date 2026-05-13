@@ -8,54 +8,65 @@ The actual project lives at `render-service/`. The top-level directory is otherw
 
 ```
 render-service/
-├── api/        FastAPI front door (enqueues RQ jobs; never touches ffmpeg or Drive)
-├── worker/     RQ worker (downloads → ffmpeg → uploads → callbacks)
-├── shared/     Pydantic v2 wire-contract models, imported by both as `from shared.models import ...`
+├── api/        FastAPI service: validates multipart in, runs ffmpeg in-process, streams MP4 out
+├── shared/     Pydantic v2 wire-contract models, imported as `from shared.models import ...`
 └── docker-compose.yml
 ```
 
-Two separate Python projects (`api/pyproject.toml`, `worker/pyproject.toml`), each with its own `uv.lock`. The `shared/` package is consumed by both via `PYTHONPATH=/app` in the Dockerfiles and via `pyproject.toml`'s `[tool.pytest.ini_options] pythonpath = [".", "../shared/.."]` for local pytest. **Both Docker builds need the project root as build context** so `shared/` is reachable.
+Single Python project (`api/pyproject.toml`) with its own `uv.lock`. The `shared/` package is consumed via `PYTHONPATH=/app` in the Dockerfile and via `[tool.pytest.ini_options] pythonpath = [".", "../shared/.."]` for local pytest. **The Docker build needs the project root as build context** so `shared/` is reachable.
 
 ## Common commands
 
 All from `render-service/`:
 
 ```bash
-# Bring the full stack up (api + worker + redis). Requires .env with RENDER_API_KEY and a Drive SA.
+# Bring the stack up (just the api container). Requires .env with RENDER_API_KEY.
 docker compose up --build
 
-# First-time only: generate lockfiles (Dockerfile falls back to `uv sync --no-dev` resolve-on-build if missing)
-cd api && uv lock && cd ../worker && uv lock && cd ..
+# First-time only: generate lockfile (Dockerfile falls back to `uv sync --no-dev` resolve-on-build if missing)
+cd api && uv lock && cd ..
 
-# Local dev with hot-reload + bind-mounted source + bind-mounted sa.json
+# Local dev with hot-reload + bind-mounted source
 cp docker-compose.override.yml.example docker-compose.override.yml
 docker compose up
 
-# Worker tests (ffmpeg command builders + probe parsing; subprocess is mocked, no ffmpeg needed)
-cd worker && uv sync && uv run pytest -q
+# Tests (ffmpeg command builders + endpoint integration with run_pipeline mocked; subprocess is mocked, no ffmpeg needed)
+cd api && uv sync && uv run pytest -q
 # Single test
-cd worker && uv run pytest tests/test_ffmpeg_runner.py::test_concat_fastpath_when_all_match_and_orientation_matches -v
+cd api && uv run pytest tests/test_ffmpeg_pipeline.py::test_concat_fastpath_when_all_match_and_orientation_matches -v
 
-# Smoke test the API (job will fail at download but proves auth + enqueue work)
-curl -s http://localhost:8000/health | jq
-curl -s -X POST http://localhost:8000/jobs -H "X-API-Key: $RENDER_API_KEY" -H "Content-Type: application/json" -d @payload.json
+# Smoke test the API (the render itself will fail unless you upload real media, but auth + multipart parsing are exercised)
+curl -s http://localhost:8000/health
+curl -s -X POST http://localhost:8000/jobs \
+  -H "X-API-Key: $RENDER_API_KEY" \
+  -F "clip_hook=@hook.mp4" \
+  -F "clip_cuerpo=@cuerpo.mp4" \
+  -F "clip_cta=@cta.mp4" \
+  -F "music=@music.mp3" \
+  -F 'params={"orientation":"vertical","music_volume":0.3,"fade_in":2,"fade_out":2,"output_name":"smoke_test"}' \
+  -o out.mp4 -D -
 ```
 
-There is no lint/format tool configured and no test suite for the API service — only the worker has tests.
+There is no lint/format tool configured.
 
 ## Architecture
 
-The service receives a Make.com webhook with 3 Google Drive clip IDs + 1 music ID, assembles a video ad with ffmpeg, uploads it back to Drive, and POSTs the result to a caller-supplied `callback_url`. Three containers: `api`, `worker`, `redis`.
+The service receives a Make.com multipart POST with 3 clip files + 1 music file, assembles a video ad with ffmpeg in-process, and streams the MP4 back in the HTTP response. Single container — no queue, no callbacks, no external storage.
 
 ### Request lifecycle
 
-1. `POST /jobs` (api/src/main.py) — validates `JobRequest` (Pydantic, `extra="forbid"`, exactly 3 clips with roles `hook`/`cuerpo`/`cta`), generates a UUID `job_id`, enqueues into RQ queue `renders`. **The API never imports the worker function** — it enqueues by string reference `WORKER_JOB_FUNCTION = "src.job_runner.run_job"` (api/src/queue_client.py). This keeps the API image free of ffmpeg and the Drive SDK.
-2. Worker picks up the job and `run_job(job_id, payload)` (worker/src/job_runner.py) executes the strict sequence: validate → mkdir workdir → download 3 clips + music → `ffprobe` each clip → concat (fast or re-encoded) → mix music → upload → success callback. Any failure raises `_FriendlyError` whose Spanish message is forwarded to the callback (and to Make/Airtable). Workdir is removed in `finally` regardless.
-3. The callback (worker/src/callback.py) retries 3× with exponential backoff (5s/15s/45s). The job is still marked `done`/`failed` in Redis whether or not the callback lands.
+1. `POST /jobs` (api/src/main.py) — auth via `X-API-Key`, parses the multipart, validates `params` against `JobParams` (Pydantic, `extra="forbid"`, orientation literal, regex on `output_name`).
+2. `render_sync` (api/src/render_orchestrator.py) acquires the module-level `asyncio.Semaphore(1)`, persists the four `UploadFile`s into a per-job tmp workdir (`/tmp/render_<uuid>_*/`), and dispatches the sync pipeline via `asyncio.to_thread` so the event loop stays responsive for `/health`.
+3. `run_pipeline` (api/src/ffmpeg_pipeline.py) runs the strict sequence: ffprobe each clip → decide fast-path vs re-encode → concat → ffprobe the concat → mix music → write the output MP4 inside the workdir. Returns a `PipelineResult(duration_seconds, concat_strategy)`.
+4. The orchestrator reads the output bytes into memory (clips < 200 MB by ops note), returns them via `StreamingResponse`, and cleans the workdir in `finally`.
+
+### Error handling
+
+Known failures inside the pipeline raise `_FriendlyError` whose Spanish message is safe to surface (carries over from the old worker). The orchestrator translates `_FriendlyError → RenderError(str(e))`. Any other exception becomes a generic `RenderError("Error inesperado en el render — revisa los logs del servicio.")` so internal details (paths, tracebacks) never reach the caller. `RenderError` is mapped to HTTP 500 with body `{"error": <message>}`.
 
 ### Concat fast-path vs re-encode
 
-`ffmpeg_runner.can_concat_without_reencode` (worker/src/ffmpeg_runner.py) returns true only when all three clips share codec, width/height, fps, audio codec, sample rate, AND match the requested `output.orientation`. If true, the worker uses ffmpeg's concat demuxer with `-c copy` (seconds). Otherwise it builds a `-filter_complex` graph that per-clip scales+crops/pads to 1080×1920 (vertical) or 1920×1080 (horizontal) at 30 fps, then concats. The strategy (`crop` vs `pad`) is controlled by `ORIENTATION_STRATEGY` env var.
+`ffmpeg_pipeline.can_concat_without_reencode` returns true only when all three clips share codec, width/height, fps, audio codec, sample rate, AND match the requested `orientation`. If true, the pipeline uses ffmpeg's concat demuxer with `-c copy` (seconds). Otherwise it builds a `-filter_complex` graph that per-clip scales+crops/pads to 1080×1920 (vertical) or 1920×1080 (horizontal) at 30 fps, then concats. The strategy (`crop` vs `pad`) is controlled by `ORIENTATION_STRATEGY`. The chosen strategy is reflected back in the response header `X-Concat-Strategy: fast|reencode`.
 
 ### Silent clips
 
@@ -63,24 +74,23 @@ When a clip has no audio stream, the re-encode path injects a `lavfi anullsrc` i
 
 ### Shared models contract
 
-`shared/models.py` is the single source of truth for the wire format. Both Dockerfiles `COPY shared /app/shared`. Changing this file requires rebuilding both images. The `JobRequest` validator enforces exactly 3 clips with the role set `{hook, cuerpo, cta}` — there is no support for more or fewer clips.
+`shared/models.py` is the single source of truth for the wire format. The Dockerfile `COPY shared /app/shared`. Changing this file requires rebuilding the image. The `JobParams` model is the JSON payload of the multipart `params` field — there is no support for clip role overrides; the three clips are always supplied as the named multipart fields `clip_hook`, `clip_cuerpo`, `clip_cta`.
 
 ### Settings
 
-`api/src/settings.py` and `worker/src/settings.py` are separate `pydantic-settings` `BaseSettings` classes. They share `REDIS_URL` and `LOG_LEVEL` but each has its own surface. Both use `@lru_cache` singletons via `get_settings()` — never instantiate `Settings()` directly.
-
-Worker exposes one of two Drive SA channels (mutually exclusive): `GOOGLE_SERVICE_ACCOUNT_JSON` (file path) **or** `GOOGLE_SERVICE_ACCOUNT_JSON_B64` (env var with base64'd JSON). The worker fails fast on startup if neither is set.
+`api/src/settings.py` is a `pydantic-settings` `BaseSettings`: `render_api_key`, `orientation_strategy`, `log_level`. `@lru_cache` singleton via `get_settings()` — never instantiate `Settings()` directly. There is no Redis, no Drive, no per-job-timeout env var — the ffmpeg hard timeout is hardcoded to 600 s in `ffmpeg_pipeline.FFMPEG_TIMEOUT_SECONDS`.
 
 ### Concurrency
 
-`WORKER_CONCURRENCY=1` is the production default. With concurrency > 1 the worker switches to `rq.worker_pool.WorkerPool` (forking). The host VPS has 2 vCPU / 7.8 GiB — do not raise above 2 (`mem_limit: 3g` in compose protects Redis/api from a runaway ffmpeg).
+`uvicorn --workers 1` in the Dockerfile is mandatory: renders are serialised via a process-local `asyncio.Semaphore(1)`. Multiple uvicorn workers would each carry their own semaphore → races for the CPU and OOM risk. The host VPS has 2 vCPU / 7.8 GiB and `mem_limit: 6g` in compose protects the host.
 
 ## Conventions to follow
 
-- **Logging is structlog JSON to stdout.** Bind `job_id` via `structlog.contextvars.bind_contextvars` at the start of `run_job` and clear in `finally`. Standard event names: `job_enqueued`, `job_started`, `downloading_clips`, `concat_fast_path`/`concat_reencode_path`, `uploading_output`, `job_done`, `job_failed`.
-- **Never log the Service Account JSON or `RENDER_API_KEY`.** `auth.require_api_key` already uses `hmac.compare_digest`.
-- **User-facing error messages are in Spanish** (the audiovisual team reads them in Make/Airtable). `_FriendlyError` in `job_runner.py` is the sentinel that gets surfaced; everything else becomes a generic "Error inesperado".
-- **Pydantic v2 only.** Use `model_validate` / `model_dump(mode="json")` (the API uses `mode="json"` so `HttpUrl` becomes a primitive before RQ pickles it).
+- **Logging is structlog JSON to stdout.** Bind `job_id` via `structlog.contextvars.bind_contextvars` at the start of `render_sync` and clear in `finally`. Standard event names: `job_started`, `concat_fast_path` / `concat_reencode_path`, `job_done`, `job_failed`, `job_failed_unexpected`.
+- **Never log `RENDER_API_KEY`.** `auth.require_api_key` already uses `hmac.compare_digest`.
+- **User-facing error messages are in Spanish** (the audiovisual team reads them in Make/Airtable). `_FriendlyError` in `ffmpeg_pipeline.py` is the sentinel that gets surfaced; everything else becomes a generic "Error inesperado".
+- **Pydantic v2 only.** Use `model_validate_json` to parse the multipart `params` field.
 - **FFmpeg builders return `list[str]`** and are pure (no subprocess). The `run()` and `probe()` functions are the only places that shell out — keeps the builders unit-testable. New ffmpeg invocations should follow this split.
-- **All MP4 outputs use `-movflags +faststart`** so Drive/web seek immediately.
-- **`output.name` is regex-validated** `^[A-Za-z0-9._-]+$` at the schema layer — don't add a second validation pass downstream.
+- **All MP4 outputs use `-movflags +faststart`** so web players seek immediately.
+- **`output_name` is regex-validated** `^[A-Za-z0-9._-]+$` at the schema layer — don't add a second validation pass downstream.
+- **The output MP4 is held in memory** before the workdir is cleaned. Acceptable while clips stay < 200 MB; if that ceiling moves, switch to streaming from disk and delay cleanup until the response is fully sent.

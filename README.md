@@ -1,41 +1,36 @@
 # Andromeda render-service
 
-Servicio que ensambla anuncios de vídeo a partir de tres clips raw (Hook + Cuerpo + CTA) y una pista de música. Está pensado para ser disparado por Make.com como parte del pipeline de Andrómeda: Make manda un POST con los IDs de Drive, el servicio descarga, concatena con FFmpeg, mezcla música, sube a Drive, y devuelve el resultado vía callback.
+Servicio que ensambla anuncios de vídeo a partir de tres clips raw (Hook + Cuerpo + CTA) y una pista de música. Está pensado para ser disparado por Make.com como parte del pipeline de Andrómeda: Make envía los cuatro archivos vía `multipart/form-data` y recibe el MP4 ensamblado en la misma respuesta HTTP. **Síncrono y sin estado externo.**
 
 ## Arquitectura
 
 ```
-            ┌─────────┐      POST /jobs       ┌────────────┐
-  Airtable ─┤ Make.com ├──────────────────────► FastAPI    │
-            └─────────┘   X-API-Key + JSON    │  (api)     │
-                                              └─────┬──────┘
-                                                    │ enqueue
-                                              ┌─────▼──────┐
-                                              │   Redis    │
-                                              │   (RQ)     │
-                                              └─────┬──────┘
-                                                    │
-                                              ┌─────▼──────┐
-                                              │  worker    │  ffmpeg
-                                              │            ├─────────► Google Drive
-                                              └─────┬──────┘
-                                                    │ POST callback_url
-                                                    ▼
-                                                 Make.com
+            ┌──────────┐    POST /jobs (multipart)    ┌──────────────┐
+  Airtable ─┤ Make.com ├──────────────────────────────►   FastAPI    │
+            └──────────┘   X-API-Key + 4 archivos     │     (api)    │
+                          ◄──────────────────────────  │   + ffmpeg   │
+                            200 OK · video/mp4         └──────────────┘
 ```
 
-Tres contenedores: `api`, `worker`, `redis`. La API solo encola; el worker hace todo el trabajo (descarga → ffprobe → ffmpeg → upload → callback). Un solo job en paralelo por defecto.
+Un solo contenedor: `api`. FFmpeg corre dentro del proceso. Las renders se serializan con un `asyncio.Semaphore(1)` (FFmpeg es CPU-bound y el VPS tiene 2 vCPU). No hay cola, ni Redis, ni callbacks, ni Drive.
 
 ## Estructura del repo
 
 ```
 render-service/
-├── api/                # FastAPI front door
-├── worker/             # RQ worker + ffmpeg + Drive
-├── shared/             # Pydantic models compartidos (contrato del wire)
+├── api/                # FastAPI + ffmpeg pipeline
+│   ├── src/
+│   │   ├── main.py                 # endpoints
+│   │   ├── auth.py                 # X-API-Key (hmac.compare_digest)
+│   │   ├── render_orchestrator.py  # Semaphore + workdir + stream out
+│   │   ├── ffmpeg_pipeline.py      # probe + concat + mix music
+│   │   └── settings.py
+│   ├── tests/
+│   └── Dockerfile
+├── shared/             # Pydantic models compartidos
 ├── docker-compose.yml
 ├── .env.example
-└── DEPLOY.md           # pasos en Easypanel
+└── DEPLOY.md
 ```
 
 ## Correrlo en local
@@ -43,7 +38,7 @@ render-service/
 ### 1. Pre-requisitos
 
 - Docker Engine 24+ y Docker Compose v2.
-- (Opcional, primera vez) `uv` instalado para generar lockfiles:
+- (Opcional, primera vez) `uv` instalado para generar el lockfile:
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
@@ -52,7 +47,7 @@ render-service/
 
 ```bash
 cp .env.example .env
-# Edita .env y rellena RENDER_API_KEY + Service Account
+# Edita .env y rellena RENDER_API_KEY
 ```
 
 Genera una API key fuerte:
@@ -61,33 +56,29 @@ Genera una API key fuerte:
 openssl rand -hex 32
 ```
 
-Para la Service Account de Google Drive, tienes dos opciones (elige UNA):
+Solo necesitas tres variables (todas las viejas de Drive/Redis/Worker desaparecieron):
 
-- **`GOOGLE_SERVICE_ACCOUNT_JSON`** — ruta al archivo dentro del contenedor (típico con bind-mount). En `docker-compose.override.yml.example` ya hay un ejemplo: deja tu `sa.json` en la raíz del repo y el worker lo verá en `/secrets/sa.json`.
-- **`GOOGLE_SERVICE_ACCOUNT_JSON_B64`** — el JSON entero codificado en base64 (típico en Easypanel). Genérala con:
-  ```bash
-  cat sa.json | base64 -w 0
-  ```
+| Variable                | Valor                                        |
+|-------------------------|----------------------------------------------|
+| `RENDER_API_KEY`        | string aleatorio largo                       |
+| `ORIENTATION_STRATEGY`  | `crop` (default) o `pad`                     |
+| `LOG_LEVEL`             | `INFO` (default)                             |
 
-Importante: la cuenta de servicio necesita acceso de **Editor** a los clips raw y la carpeta de output. Comparte cada carpeta de Drive con el email de la SA (`xxxx@xxxx.iam.gserviceaccount.com`).
-
-### 3. (Primera vez) Generar lockfiles
-
-Los `uv.lock` no están commiteados aún. Genéralos antes del primer build:
+### 3. (Primera vez) Generar el lockfile
 
 ```bash
-cd api && uv lock && cd ../worker && uv lock && cd ..
+cd api && uv lock && cd ..
 ```
 
-> Si no tienes `uv` local, el Dockerfile cae a `uv sync --no-dev` (resuelve en caliente). Útil para arrancar pero menos reproducible — commitea los lockfiles cuanto antes.
+Si no tienes `uv` local, el Dockerfile cae a `uv sync --no-dev` (resuelve en caliente). Útil para arrancar pero menos reproducible — commitea el lockfile cuanto antes.
 
-### 4. (Opcional) Override para dev
+### 4. (Opcional) Override para dev con hot-reload
 
 ```bash
 cp docker-compose.override.yml.example docker-compose.override.yml
 ```
 
-Con el override, los `src/` se bind-montan y la API recarga al editar.
+Con el override, `api/src/` y `shared/` se bind-montan y la API recarga al editar.
 
 ### 5. Arrancar
 
@@ -95,102 +86,109 @@ Con el override, los `src/` se bind-montan y la API recarga al editar.
 docker compose up --build
 ```
 
-Tres contenedores arrancan. Logs JSON estructurados en stdout.
+Un solo contenedor arranca. Logs JSON estructurados en stdout.
 
 ### 6. Verificar
 
 ```bash
-# Health
-curl -s http://localhost:8000/health | jq
-# {"status": "ok", "redis": "ok"}
+# Health (sin auth)
+curl -s http://localhost:8000/health
+# {"status":"ok"}
 
-# FFmpeg dentro del worker
-docker compose exec worker ffmpeg -version | head -1
-
-# Job de prueba (falla en descarga porque los IDs no existen, pero confirma el flujo de validación + encolado)
+# Render real — necesitas 4 archivos en el directorio actual
 curl -s -X POST http://localhost:8000/jobs \
-  -H "Content-Type: application/json" \
   -H "X-API-Key: $RENDER_API_KEY" \
-  -d '{
-    "clips": [
-      {"drive_id": "fake_hook_id", "role": "hook"},
-      {"drive_id": "fake_cuerpo_id", "role": "cuerpo"},
-      {"drive_id": "fake_cta_id", "role": "cta"}
-    ],
-    "music": {"drive_id": "fake_music_id", "volume": 0.3, "fade_in": 2.0, "fade_out": 2.0},
-    "output": {"name": "smoke_test", "folder_drive_id": "fake_folder_id", "orientation": "vertical"},
-    "callback_url": "https://httpbin.org/post",
-    "metadata": {"airtable_record_id": "recXXX"}
-  }' | jq
+  -F "clip_hook=@hook.mp4" \
+  -F "clip_cuerpo=@cuerpo.mp4" \
+  -F "clip_cta=@cta.mp4" \
+  -F "music=@music.mp3" \
+  -F 'params={"orientation":"vertical","music_volume":0.3,"fade_in":2,"fade_out":2,"output_name":"smoke_test"}' \
+  -o out.mp4 -D headers.txt
 ```
 
-Si el body es válido y la API key correcta: respuesta `202 { "job_id": "...", "status": "queued" }`.
-
-Para consultar:
-
-```bash
-curl -s -H "X-API-Key: $RENDER_API_KEY" http://localhost:8000/jobs/<job_id> | jq
-```
+Si todo va bien: respuesta `200 OK` con `Content-Type: video/mp4` y los headers extra `X-Output-Duration-Seconds` y `X-Concat-Strategy: fast|reencode`. El MP4 cae en `out.mp4`.
 
 ## API
 
-| Método | Path             | Auth          | Para                         |
-|-------|------------------|---------------|------------------------------|
-| GET   | `/health`        | —             | UptimeRobot                  |
-| POST  | `/jobs`          | `X-API-Key`   | Make encola un render        |
-| GET   | `/jobs/{job_id}` | `X-API-Key`   | Consulta de estado           |
+| Método | Path      | Auth        | Para                                      |
+|--------|-----------|-------------|-------------------------------------------|
+| GET    | `/health` | —           | UptimeRobot                               |
+| POST   | `/jobs`   | `X-API-Key` | Make manda los 4 archivos y recibe el MP4 |
 
-El schema completo del request/response está en `shared/models.py` (Pydantic v2). FastAPI sirve el OpenAPI auto-generado en `http://localhost:8000/docs`.
+FastAPI sirve el OpenAPI auto-generado en `http://localhost:8000/docs`.
 
-### Callback hacia Make
+### Request — `POST /jobs`
 
-El worker hace POST al `callback_url` del request con:
+Content-Type: `multipart/form-data`. Campos:
+
+| Campo         | Tipo    | Notas                                                |
+|---------------|---------|------------------------------------------------------|
+| `clip_hook`   | file    | MP4                                                  |
+| `clip_cuerpo` | file    | MP4                                                  |
+| `clip_cta`    | file    | MP4                                                  |
+| `music`       | file    | MP3 / M4A / WAV — libavformat sniff lo resuelve      |
+| `params`      | string  | JSON serializado de `JobParams` (ver `shared/models.py`) |
+
+Schema de `params`:
 
 ```json
 {
-  "job_id": "uuid",
-  "status": "done|failed",
-  "output_drive_id": "1xyz...",
-  "output_url": "https://drive.google.com/file/d/1xyz/view",
-  "duration_seconds": 87.4,
-  "error": null,
-  "metadata": { "...passthrough..." }
+  "orientation": "vertical",   // "vertical" | "horizontal"
+  "music_volume": 0.3,         // 0.0 – 1.0
+  "fade_in": 2.0,              // 0.0 – 10.0 segundos
+  "fade_out": 2.0,             // 0.0 – 10.0 segundos
+  "output_name": "ad_2026_05"  // ^[A-Za-z0-9._-]+$, max 200 chars
 }
 ```
 
-Retry: 3 intentos con backoff exponencial (5s, 15s, 45s). Si los 3 fallan, el job queda igualmente marcado `done` en Redis (consultable vía `GET /jobs/{id}`).
+### Response — éxito
+
+- Status: `200 OK`
+- Content-Type: `video/mp4`
+- `Content-Disposition: attachment; filename="<output_name>.mp4"`
+- `X-Output-Duration-Seconds: <duración del vídeo final>`
+- `X-Concat-Strategy: fast | reencode`
+- Body: bytes del MP4.
+
+### Response — error
+
+- `401` si falta o no coincide el `X-API-Key`.
+- `422` si `params` no parsea o no cumple el schema.
+- `500` con body JSON `{"error": "<mensaje en español>"}` si el render falla. Los errores conocidos llevan el mensaje original (en español, seguro de mostrar a usuario). Los inesperados se ofuscan como `"Error inesperado en el render — revisa los logs del servicio."`.
 
 ## Logs
 
-JSON estructurado en stdout. Cada línea incluye `job_id` cuando aplica.
+JSON estructurado en stdout. Cada línea incluye `job_id` y `output_name` cuando aplica.
 
 ```bash
-docker compose logs -f worker | jq -R 'fromjson? // .'
+docker compose logs -f api | jq -R 'fromjson? // .'
 ```
 
-Eventos clave: `job_enqueued`, `job_started`, `downloading_clips`, `concat_fast_path` / `concat_reencode_path`, `uploading_output`, `job_done`, `job_failed`.
+Eventos clave: `job_started`, `concat_fast_path` / `concat_reencode_path`, `job_done`, `job_failed`, `job_failed_unexpected`.
 
 ## Tests
 
-Tests unitarios del builder de comandos FFmpeg (subprocess mockeado):
+Builders FFmpeg + integration test del endpoint (subprocess y `run_pipeline` mockeados — no se necesita ffmpeg para correrlos):
 
 ```bash
-cd worker
+cd api
 uv sync
 uv run pytest -q
 ```
 
-No hay tests E2E en el repo — requieren clips reales y credenciales de Drive.
+No hay tests E2E con clips reales en el repo.
 
 ## Decisiones que se tomaron fuera de la spec
 
-- **Layout de `shared/`**: el módulo común se monta en `/app/shared` dentro de ambas imágenes (Docker build context es la raíz del repo). Las imports son `from shared.models import ...` desde api y worker. Esto evita duplicar el archivo. Para dev local fuera de Docker, los `conftest.py` añaden la raíz al `sys.path`.
-- **Manejo de clips sin audio**: si alguno de los 3 clips no tiene stream de audio, el worker añade un input `lavfi anullsrc` con duración igual al clip y lo enchufa en el `concat=`. El audio finalmente se mezcla con la música igual que en el caso normal. Esto es robusto sin caer al fallo "stream not found".
-- **`afade=t=out` con `fade_out > duration`**: el `start` del fade se clampea a 0 en vez de devolver un valor negativo a FFmpeg.
-- **`output.name`**: se valida con regex `^[A-Za-z0-9._-]+$` — sin espacios ni separadores raros que puedan romper Drive o el shell. Si el equipo audiovisual mete un guion bajo y un número, perfecto.
-- **`hmac.compare_digest`** en `require_api_key` — comparación constante en el tiempo, no leak de longitud.
-- **`MediaFileUpload(resumable=True)`** para subidas grandes, chunks de 8 MiB.
-- **`+faststart`** en todos los outputs MP4 — Drive y reproductores web hacen seek inmediato.
+- **Layout de `shared/`**: el módulo común se monta en `/app/shared` (build context = raíz del repo). Imports siguen siendo `from shared.models import ...`. El `conftest.py` del api añade la raíz al `sys.path` para dev local fuera de Docker.
+- **Manejo de clips sin audio**: si alguno de los 3 clips no tiene stream de audio, el pipeline añade un input `lavfi anullsrc` con duración igual al clip y lo enchufa en el `concat=`. Robusto sin caer en "stream not found".
+- **`afade=t=out` con `fade_out > duration`**: el `start` del fade se clampea a 0.
+- **`output_name`**: regex `^[A-Za-z0-9._-]+$` — sin espacios ni separadores raros que rompan el shell.
+- **`hmac.compare_digest`** en `require_api_key` — comparación constante en el tiempo.
+- **`+faststart`** en todos los outputs MP4.
+- **Output en memoria**: el MP4 final se carga entero en memoria antes de limpiar el workdir. OK mientras los renders sean < 200 MB; revisar si la cota sube.
+- **`uvicorn --workers 1`**: con más workers cada uno tendría su propio Semaphore → races por la CPU.
+- **`FFMPEG_TIMEOUT_SECONDS=600`** está hardcoded en `ffmpeg_pipeline.py`. Si necesitas tunear, edita la constante.
 
 ## Producción
 

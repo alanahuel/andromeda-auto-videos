@@ -2,25 +2,16 @@ from __future__ import annotations
 
 import logging
 import sys
-import uuid
-from typing import Any
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Response, status
-from redis.exceptions import RedisError
-from rq.exceptions import NoSuchJobError
-from rq.job import Job
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 
-from shared.models import (
-    HealthDegraded,
-    HealthOk,
-    JobAccepted,
-    JobRequest,
-    JobStatus,
-)
+from shared.models import JobParams
 
 from .auth import require_api_key
-from .queue_client import WORKER_JOB_FUNCTION, get_queue, ping_redis
+from .render_orchestrator import RenderError, render_sync
 from .settings import get_settings
 
 
@@ -41,93 +32,50 @@ def _configure_logging() -> None:
 _configure_logging()
 log = structlog.get_logger("render-api")
 
-app = FastAPI(title="Andromeda render-service", version="0.1.0")
+app = FastAPI(title="Andromeda render-service", version="0.2.0")
 
 
-@app.get("/health", response_model=None)
-def health(response: Response) -> dict[str, str]:
-    if ping_redis():
-        return HealthOk().model_dump()
-    response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-    return HealthDegraded().model_dump()
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
 
 
-@app.post(
-    "/jobs",
-    response_model=JobAccepted,
-    status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_api_key)],
-)
-def create_job(req: JobRequest) -> JobAccepted:
-    job_id = str(uuid.uuid4())
-    settings = get_settings()
-
-    # Pydantic v2: by_alias=False, mode="json" turns HttpUrl/etc into JSON-safe primitives.
-    payload: dict[str, Any] = req.model_dump(mode="json")
+@app.post("/jobs", dependencies=[Depends(require_api_key)])
+async def create_job(
+    clip_hook: UploadFile = File(...),
+    clip_cuerpo: UploadFile = File(...),
+    clip_cta: UploadFile = File(...),
+    music: UploadFile = File(...),
+    params: str = Form(...),
+):
+    try:
+        job_params = JobParams.model_validate_json(params)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"params inválidos: {exc.errors()}",
+        )
 
     try:
-        queue = get_queue()
-        queue.enqueue(
-            WORKER_JOB_FUNCTION,
-            job_id,
-            payload,
-            job_id=job_id,
-            job_timeout=settings.job_timeout_seconds,
-            result_ttl=86_400,
-            failure_ttl=86_400,
-            description=f"render {req.output.name}",
+        result = await render_sync(
+            clip_hook=clip_hook,
+            clip_cuerpo=clip_cuerpo,
+            clip_cta=clip_cta,
+            music=music,
+            params=job_params,
         )
-    except RedisError as exc:
-        log.error("redis_enqueue_failed", job_id=job_id, error=str(exc))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="queue unavailable",
+    except RenderError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"error": str(exc)},
         )
 
-    log.info(
-        "job_enqueued",
-        job_id=job_id,
-        output_name=req.output.name,
-        orientation=req.output.orientation,
+    return StreamingResponse(
+        result.output_stream,
+        media_type="video/mp4",
+        headers={
+            "X-Output-Duration-Seconds": str(result.duration_seconds),
+            "X-Concat-Strategy": result.concat_strategy,
+            "Content-Disposition": f'attachment; filename="{job_params.output_name}.mp4"',
+        },
     )
-    return JobAccepted(job_id=job_id, status="queued")
-
-
-_RQ_STATUS_MAP = {
-    "queued": "queued",
-    "deferred": "queued",
-    "scheduled": "queued",
-    "started": "processing",
-    "finished": "done",
-    "failed": "failed",
-    "stopped": "failed",
-    "canceled": "failed",
-}
-
-
-@app.get(
-    "/jobs/{job_id}",
-    response_model=JobStatus,
-    dependencies=[Depends(require_api_key)],
-)
-def get_job(job_id: str) -> JobStatus:
-    try:
-        queue = get_queue()
-        job = Job.fetch(job_id, connection=queue.connection)
-    except NoSuchJobError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
-    except RedisError as exc:
-        log.error("redis_fetch_failed", job_id=job_id, error=str(exc))
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="queue unavailable",
-        )
-
-    rq_status = job.get_status(refresh=True)
-    mapped = _RQ_STATUS_MAP.get(rq_status, "queued")
-    error: str | None = None
-    if mapped == "failed":
-        # exc_info is a stack trace — surface the latest line only.
-        info = (job.exc_info or "").strip()
-        error = info.splitlines()[-1] if info else "job failed"
-    return JobStatus(job_id=job_id, status=mapped, error=error)

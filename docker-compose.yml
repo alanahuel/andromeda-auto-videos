@@ -1,19 +1,4 @@
 services:
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
-    volumes:
-      - redis-data:/data
-    networks:
-      - internal
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 5s
-
   api:
     build:
       context: .
@@ -21,40 +6,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-    depends_on:
-      redis:
-        condition: service_healthy
     ports:
       - "8000:8000"
-    networks:
-      - internal
-
-  worker:
-    build:
-      context: .
-      dockerfile: worker/Dockerfile
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks:
-      - internal
     # Hetzner box: 2 vCPU, 7.8 GiB. Cap memory so a runaway ffmpeg cannot
-    # take Redis or the API down with it.
-    mem_limit: 3g
+    # OOM the host.
+    mem_limit: 6g
     mem_reservation: 1g
-    # Job working files live under WORKDIR_BASE (/tmp by default). tmpfs is
-    # off by design — renders can be GBs and OOM-trash the host.
-
-networks:
-  internal:
-    driver: bridge
-
-volumes:
-  redis-data:
+    # Render workdirs live under /tmp inside the container. tmpfs is off
+    # by design — renders can be GBs and OOM-trash the host.

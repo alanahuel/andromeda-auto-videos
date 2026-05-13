@@ -15,11 +15,3 @@ services:
         "--port", "8000",
         "--reload",
       ]
-
-  worker:
-    volumes:
-      - ./worker/src:/app/src
-      - ./shared:/app/shared
-      # Bind-mount your local Service Account JSON for dev.
-      # Then set GOOGLE_SERVICE_ACCOUNT_JSON=/secrets/sa.json in your .env
-      - ./sa.json:/secrets/sa.json:ro
