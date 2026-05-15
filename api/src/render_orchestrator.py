@@ -44,6 +44,7 @@ class RenderResult:
     output_stream: AsyncIterator[bytes]
     duration_seconds: float
     concat_strategy: str
+    job_id: str
 
 
 async def _persist(upload: UploadFile, dest: Path) -> None:
@@ -109,6 +110,7 @@ async def render_sync(
                 output_stream=stream(),
                 duration_seconds=pipeline_result.duration_seconds,
                 concat_strategy=pipeline_result.concat_strategy,
+                job_id=job_id,
             )
     except _FriendlyError as exc:
         log.error("job_failed", error=str(exc))

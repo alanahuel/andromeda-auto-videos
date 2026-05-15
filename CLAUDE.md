@@ -66,7 +66,7 @@ Known failures inside the pipeline raise `_FriendlyError` whose Spanish message 
 
 ### Concat fast-path vs re-encode
 
-`ffmpeg_pipeline.can_concat_without_reencode` returns true only when all three clips share codec, width/height, fps, audio codec, sample rate, AND match the requested `orientation`. If true, the pipeline uses ffmpeg's concat demuxer with `-c copy` (seconds). Otherwise it builds a `-filter_complex` graph that per-clip scales+crops/pads to 1080×1920 (vertical) or 1920×1080 (horizontal) at 30 fps, then concats. The strategy (`crop` vs `pad`) is controlled by `ORIENTATION_STRATEGY`. The chosen strategy is reflected back in the response header `X-Concat-Strategy: fast|reencode`.
+`ffmpeg_pipeline.can_concat_without_reencode` returns true only when all three clips share codec, width/height, fps, audio codec, sample rate, AND match the requested `orientation`. If true, the pipeline uses ffmpeg's concat demuxer with `-c copy` (seconds). Otherwise it builds a `-filter_complex` graph that per-clip scales+crops/pads to 1080×1920 (vertical) or 1920×1080 (horizontal) at 30 fps, then concats. The strategy (`crop` vs `pad`) is controlled by `ORIENTATION_STRATEGY`. The chosen strategy is reflected back in the response header `X-Concat-Strategy: fast|reencode`. The per-render UUID generated in `render_sync` is also surfaced as `X-Job-Id` so callers can correlate logs with the response.
 
 ### Silent clips
 

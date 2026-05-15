@@ -106,7 +106,7 @@ curl -s -X POST http://localhost:8000/jobs \
   -o out.mp4 -D headers.txt
 ```
 
-Si todo va bien: respuesta `200 OK` con `Content-Type: video/mp4` y los headers extra `X-Output-Duration-Seconds` y `X-Concat-Strategy: fast|reencode`. El MP4 cae en `out.mp4`.
+Si todo va bien: respuesta `200 OK` con `Content-Type: video/mp4` y los headers extra `X-Job-Id`, `X-Output-Duration-Seconds` y `X-Concat-Strategy: fast|reencode`. El MP4 cae en `out.mp4`.
 
 ## API
 
@@ -146,6 +146,7 @@ Schema de `params`:
 - Status: `200 OK`
 - Content-Type: `video/mp4`
 - `Content-Disposition: attachment; filename="<output_name>.mp4"`
+- `X-Job-Id: <UUID asignado al render>`
 - `X-Output-Duration-Seconds: <duración del vídeo final>`
 - `X-Concat-Strategy: fast | reencode`
 - Body: bytes del MP4.

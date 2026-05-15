@@ -74,6 +74,7 @@ async def create_job(
         result.output_stream,
         media_type="video/mp4",
         headers={
+            "X-Job-Id": result.job_id,
             "X-Output-Duration-Seconds": str(result.duration_seconds),
             "X-Concat-Strategy": result.concat_strategy,
             "Content-Disposition": f'attachment; filename="{job_params.output_name}.mp4"',

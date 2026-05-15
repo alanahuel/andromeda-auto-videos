@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,6 +70,8 @@ def test_post_jobs_returns_mp4_with_headers_on_success():
     assert resp.headers["content-type"] == "video/mp4"
     assert resp.headers["x-output-duration-seconds"] == "42.5"
     assert resp.headers["x-concat-strategy"] == "fast"
+    job_id = resp.headers["x-job-id"]
+    uuid.UUID(job_id)  # raises if not a valid UUID
     assert 'filename="ad_2026_05_test.mp4"' in resp.headers["content-disposition"]
     assert resp.content == _FAKE_MP4
 
