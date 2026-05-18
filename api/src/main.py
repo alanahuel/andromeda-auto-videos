@@ -45,7 +45,7 @@ async def create_job(
     clip_hook: UploadFile = File(...),
     clip_cuerpo: UploadFile = File(...),
     clip_cta: UploadFile = File(...),
-    music: UploadFile = File(...),
+    music: UploadFile | None = File(None),
     params: str = Form(...),
 ):
     try:

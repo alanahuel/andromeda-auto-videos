@@ -58,7 +58,7 @@ async def render_sync(
     clip_hook: UploadFile,
     clip_cuerpo: UploadFile,
     clip_cta: UploadFile,
-    music: UploadFile,
+    music: UploadFile | None,
     params: JobParams,
 ) -> RenderResult:
     job_id = str(uuid.uuid4())
@@ -67,17 +67,24 @@ async def render_sync(
 
     try:
         async with _render_lock:
-            log.info("job_started", orientation=params.orientation)
+            log.info(
+                "job_started",
+                orientation=params.orientation,
+                has_music=music is not None,
+            )
             started = time.monotonic()
 
             hook_path = workdir / "hook.mp4"
             cuerpo_path = workdir / "cuerpo.mp4"
             cta_path = workdir / "cta.mp4"
-            music_path = workdir / "music"
             await _persist(clip_hook, hook_path)
             await _persist(clip_cuerpo, cuerpo_path)
             await _persist(clip_cta, cta_path)
-            await _persist(music, music_path)
+
+            music_path: Path | None = None
+            if music is not None:
+                music_path = workdir / "music"
+                await _persist(music, music_path)
 
             output_path = workdir / f"{params.output_name}.mp4"
 

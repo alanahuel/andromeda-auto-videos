@@ -349,11 +349,16 @@ def run_pipeline(
     hook: Path,
     cuerpo: Path,
     cta: Path,
-    music: Path,
+    music: Path | None,
     output: Path,
     params: JobParams,
 ) -> PipelineResult:
-    """Probe → concat (fast or re-encode) → mix music → write output.
+    """Probe → concat (fast or re-encode) → mix music (if any) → write output.
+
+    When `music` is None the clips are assumed pre-edited with their own
+    audio: the concat is written straight to `output` (both concat builders
+    already emit `-movflags +faststart`) and the mix step is skipped, so the
+    pre-edited audio passes through untouched.
 
     Synchronous and CPU-bound. Call from a worker thread.
     Known failures raise `_FriendlyError` (Spanish, safe to surface).
@@ -372,7 +377,9 @@ def run_pipeline(
         raise _FriendlyError(str(exc)) from exc
 
     # ---- 2. Concat ----
-    concat_path = workdir / "concat.mp4"
+    # With no music, the concat IS the final output (clips carry their own
+    # pre-edited audio). With music, concat is an intermediate the mix reads.
+    concat_path = output if music is None else workdir / "concat.mp4"
     orientation = params.orientation
 
     if can_concat_without_reencode(infos, orientation):
@@ -411,7 +418,13 @@ def run_pipeline(
             "El vídeo concatenado tiene duración 0 — uno de los clips está vacío."
         )
 
-    # ---- 4. Mix music ----
+    # ---- 4. Mix music (skipped when clips are pre-edited with their audio) ----
+    if music is None:
+        log.info("music_skipped")
+        return PipelineResult(
+            duration_seconds=round(duration, 2), concat_strategy=concat_strategy
+        )
+
     mix_cmd = build_music_mix_cmd(
         concat_path=str(concat_path),
         music_path=str(music),

@@ -76,6 +76,30 @@ def test_post_jobs_returns_mp4_with_headers_on_success():
     assert resp.content == _FAKE_MP4
 
 
+def test_post_jobs_succeeds_without_music_and_passes_none_to_pipeline():
+    captured: dict = {}
+
+    def _capturing_pipeline(*, output: Path, music, **_kwargs) -> PipelineResult:
+        captured["music"] = music
+        output.write_bytes(_FAKE_MP4)
+        return PipelineResult(duration_seconds=10.0, concat_strategy="reencode")
+
+    files = _multipart_files()
+    del files["music"]
+
+    with patch("src.render_orchestrator.run_pipeline", side_effect=_capturing_pipeline):
+        resp = client.post(
+            "/jobs",
+            headers={"X-API-Key": API_KEY},
+            data={"params": _params()},
+            files=files,
+        )
+
+    assert resp.status_code == 200
+    assert resp.content == _FAKE_MP4
+    assert captured["music"] is None
+
+
 def test_post_jobs_rejects_missing_api_key():
     resp = client.post(
         "/jobs",
