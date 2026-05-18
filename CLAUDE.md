@@ -51,13 +51,13 @@ There is no lint/format tool configured.
 
 ## Architecture
 
-The service receives a Make.com multipart POST with 3 clip files + 1 music file, assembles a video ad with ffmpeg in-process, and streams the MP4 back in the HTTP response. Single container — no queue, no callbacks, no external storage.
+The service receives a Make.com multipart POST with 3 clip files + an optional music file, assembles a video ad with ffmpeg in-process, and streams the MP4 back in the HTTP response. When `music` is omitted the clips are treated as pre-edited with their own audio: the concat is written straight to the output and the mix step is skipped (existing audio passes through untouched — `fade_in`/`fade_out` then don't apply). Single container — no queue, no callbacks, no external storage.
 
 ### Request lifecycle
 
 1. `POST /jobs` (api/src/main.py) — auth via `X-API-Key`, parses the multipart, validates `params` against `JobParams` (Pydantic, `extra="forbid"`, orientation literal, regex on `output_name`).
-2. `render_sync` (api/src/render_orchestrator.py) acquires the module-level `asyncio.Semaphore(1)`, persists the four `UploadFile`s into a per-job tmp workdir (`/tmp/render_<uuid>_*/`), and dispatches the sync pipeline via `asyncio.to_thread` so the event loop stays responsive for `/health`.
-3. `run_pipeline` (api/src/ffmpeg_pipeline.py) runs the strict sequence: ffprobe each clip → decide fast-path vs re-encode → concat → ffprobe the concat → mix music → write the output MP4 inside the workdir. Returns a `PipelineResult(duration_seconds, concat_strategy)`.
+2. `render_sync` (api/src/render_orchestrator.py) acquires the module-level `asyncio.Semaphore(1)`, persists the three clip `UploadFile`s (plus `music` if present) into a per-job tmp workdir (`/tmp/render_<uuid>_*/`), passing `music=None` to the pipeline when no music file was uploaded, and dispatches the sync pipeline via `asyncio.to_thread` so the event loop stays responsive for `/health`.
+3. `run_pipeline` (api/src/ffmpeg_pipeline.py) runs the strict sequence: ffprobe each clip → decide fast-path vs re-encode → concat → ffprobe the concat → mix music (skipped when `music is None`; concat is written directly to the output instead) → write the output MP4 inside the workdir. Returns a `PipelineResult(duration_seconds, concat_strategy)`.
 4. The orchestrator reads the output bytes into memory (clips < 200 MB by ops note), returns them via `StreamingResponse`, and cleans the workdir in `finally`.
 
 ### Error handling
