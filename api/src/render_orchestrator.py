@@ -24,7 +24,7 @@ from typing import AsyncIterator
 import structlog
 from fastapi import UploadFile
 
-from shared.models import JobParams
+from shared.models import ErrorCode, JobParams
 
 from .ffmpeg_pipeline import _FriendlyError, run_pipeline
 
@@ -34,9 +34,36 @@ log = structlog.get_logger("render-api")
 # Serialise renders: FFmpeg is CPU-bound; one job at a time matches WORKER_CONCURRENCY=1.
 _render_lock = asyncio.Semaphore(1)
 
+# Stable error code → HTTP status. Anything not listed is a server fault (500).
+_CODE_TO_STATUS: dict[str, int] = {
+    "invalid_params": 422,
+    "clip_unreadable": 422,
+    "clip_no_video": 422,
+    "empty_clip": 422,
+    "probe_timeout": 504,
+    "ffmpeg_timeout": 504,
+    "render_failed": 500,
+    "internal_error": 500,
+}
+
+
+def status_for_code(code: str) -> int:
+    return _CODE_TO_STATUS.get(code, 500)
+
 
 class RenderError(Exception):
-    """Public error surfaced as a 500 to the caller. Message is safe."""
+    """Public error surfaced to the caller. Message is safe (Spanish).
+
+    Carries the stable `code`, the mapped HTTP `http_status`, and the
+    `job_id` so the caller can correlate the failure with the logs.
+    """
+
+    def __init__(self, message: str, *, code: ErrorCode, job_id: str | None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code: ErrorCode = code
+        self.job_id = job_id
+        self.http_status = status_for_code(code)
 
 
 @dataclass(frozen=True)
@@ -120,11 +147,15 @@ async def render_sync(
                 job_id=job_id,
             )
     except _FriendlyError as exc:
-        log.error("job_failed", error=str(exc))
-        raise RenderError(str(exc)) from exc
+        log.error("job_failed", error=str(exc), error_code=exc.code)
+        raise RenderError(str(exc), code=exc.code, job_id=job_id) from exc
     except Exception as exc:
         log.exception("job_failed_unexpected", error_type=type(exc).__name__)
-        raise RenderError("Error inesperado en el render — revisa los logs del servicio.") from exc
+        raise RenderError(
+            "Error inesperado en el render — revisa los logs del servicio.",
+            code="internal_error",
+            job_id=job_id,
+        ) from exc
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         structlog.contextvars.clear_contextvars()

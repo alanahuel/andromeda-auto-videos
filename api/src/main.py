@@ -4,11 +4,11 @@ import logging
 import sys
 
 import structlog
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-from shared.models import JobParams
+from shared.models import SUCCESS_CODE, ErrorResponse, JobParams
 
 from .auth import require_api_key
 from .render_orchestrator import RenderError, render_sync
@@ -51,9 +51,14 @@ async def create_job(
     try:
         job_params = JobParams.model_validate_json(params)
     except ValidationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"params inválidos: {exc.errors()}",
+        return JSONResponse(
+            status_code=422,
+            content=ErrorResponse(
+                error=f"params inválidos: {exc.errors()}",
+                code="invalid_params",
+                job_id=None,
+            ).model_dump(),
+            headers={"X-Status-Code": "invalid_params"},
         )
 
     try:
@@ -65,15 +70,22 @@ async def create_job(
             params=job_params,
         )
     except RenderError as exc:
+        headers = {"X-Status-Code": exc.code}
+        if exc.job_id:
+            headers["X-Job-Id"] = exc.job_id
         return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"error": str(exc)},
+            status_code=exc.http_status,
+            content=ErrorResponse(
+                error=exc.message, code=exc.code, job_id=exc.job_id
+            ).model_dump(),
+            headers=headers,
         )
 
     return StreamingResponse(
         result.output_stream,
         media_type="video/mp4",
         headers={
+            "X-Status-Code": SUCCESS_CODE,
             "X-Job-Id": result.job_id,
             "X-Output-Duration-Seconds": str(result.duration_seconds),
             "X-Concat-Strategy": result.concat_strategy,

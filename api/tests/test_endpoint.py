@@ -70,6 +70,7 @@ def test_post_jobs_returns_mp4_with_headers_on_success():
     assert resp.headers["content-type"] == "video/mp4"
     assert resp.headers["x-output-duration-seconds"] == "42.5"
     assert resp.headers["x-concat-strategy"] == "fast"
+    assert resp.headers["x-status-code"] == "ok"
     job_id = resp.headers["x-job-id"]
     uuid.UUID(job_id)  # raises if not a valid UUID
     assert 'filename="ad_2026_05_test.mp4"' in resp.headers["content-disposition"]
@@ -162,7 +163,45 @@ def test_post_jobs_500_with_spanish_message_when_pipeline_raises_friendly_error(
         )
 
     assert resp.status_code == 500
-    assert "FFmpeg falló al concatenar los clips" in resp.json()["error"]
+    body = resp.json()
+    assert "FFmpeg falló al concatenar los clips" in body["error"]
+    assert body["code"] == "render_failed"
+    assert resp.headers["x-status-code"] == "render_failed"
+    # job_id is surfaced in body + header so callers can correlate with logs.
+    assert body["job_id"]
+    assert resp.headers["X-Job-Id"] == body["job_id"]
+
+
+def test_post_jobs_422_when_pipeline_raises_clip_unreadable():
+    def _boom(**_kwargs):
+        raise _FriendlyError("clip corrupto", code="clip_unreadable")
+
+    with patch("src.render_orchestrator.run_pipeline", side_effect=_boom):
+        resp = client.post(
+            "/jobs",
+            headers={"X-API-Key": API_KEY},
+            data={"params": _params()},
+            files=_multipart_files(),
+        )
+
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "clip_unreadable"
+
+
+def test_post_jobs_504_when_pipeline_times_out():
+    def _boom(**_kwargs):
+        raise _FriendlyError("FFmpeg colgado", code="ffmpeg_timeout")
+
+    with patch("src.render_orchestrator.run_pipeline", side_effect=_boom):
+        resp = client.post(
+            "/jobs",
+            headers={"X-API-Key": API_KEY},
+            data={"params": _params()},
+            files=_multipart_files(),
+        )
+
+    assert resp.status_code == 504
+    assert resp.json()["code"] == "ffmpeg_timeout"
 
 
 def test_post_jobs_500_generic_when_pipeline_raises_unexpected_error():
@@ -178,10 +217,26 @@ def test_post_jobs_500_generic_when_pipeline_raises_unexpected_error():
         )
 
     assert resp.status_code == 500
-    body = resp.json()["error"]
-    assert "Error inesperado" in body
+    body = resp.json()
+    assert "Error inesperado" in body["error"]
+    assert body["code"] == "internal_error"
     # The raw exception message must NOT leak to the caller.
-    assert "disk full" not in body
+    assert "disk full" not in body["error"]
+
+
+def test_post_jobs_422_invalid_params_has_stable_code():
+    resp = client.post(
+        "/jobs",
+        headers={"X-API-Key": API_KEY},
+        data={"params": "{not valid json"},
+        files=_multipart_files(),
+    )
+
+    assert resp.status_code == 422
+    assert resp.headers["x-status-code"] == "invalid_params"
+    body = resp.json()
+    assert body["code"] == "invalid_params"
+    assert body["job_id"] is None
 
 
 def test_health_ok_no_auth_required():

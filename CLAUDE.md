@@ -62,7 +62,26 @@ The service receives a Make.com multipart POST with 3 clip files + an optional m
 
 ### Error handling
 
-Known failures inside the pipeline raise `_FriendlyError` whose Spanish message is safe to surface (carries over from the old worker). The orchestrator translates `_FriendlyError → RenderError(str(e))`. Any other exception becomes a generic `RenderError("Error inesperado en el render — revisa los logs del servicio.")` so internal details (paths, tracebacks) never reach the caller. `RenderError` is mapped to HTTP 500 with body `{"error": <message>}`.
+**Every response carries `X-Status-Code`**: `ok` on a 2xx, the stable `ErrorCode` on any failure. This is the single header Make/Airtable should branch on regardless of success/failure (a successful response is the binary MP4 and can't carry a JSON `code`). Values: `SUCCESS_CODE` (`"ok"`) ∪ `ErrorCode`, typed as `ResultCode` in `shared/models.py`.
+
+Every non-2xx from `POST /jobs` *also* returns the `ErrorResponse` JSON body (`shared/models.py`): `{"error": <safe Spanish message>, "code": <stable ErrorCode>, "job_id": <uuid|null>}` — same `code` as the header. **Branch on `code`, never on the message text** — the Spanish string is free to reword. `job_id` is also echoed in the `X-Job-Id` header on errors (null/absent when the failure precedes job creation, e.g. invalid params) so a failure correlates with the structlog `job_id`.
+
+Known failures inside the pipeline raise `_FriendlyError(message, code=...)` whose Spanish message is safe to surface. Both `_FriendlyError` and the lower-level `FfmpegError` carry a stable `code`; `run_pipeline` re-raises `FfmpegError` as `_FriendlyError` preserving `exc.code`. The orchestrator translates `_FriendlyError → RenderError(message, code, job_id)`; any other exception becomes `RenderError("Error inesperado…", code="internal_error")` so internal details (paths, tracebacks) never reach the caller — only the logs.
+
+`code → HTTP status` lives in `render_orchestrator._CODE_TO_STATUS` (the single mapping point):
+
+| code | HTTP | meaning |
+|---|---|---|
+| `invalid_params` | 422 | `params` JSON failed `JobParams` validation |
+| `clip_unreadable` | 422 | ffprobe could not read a clip (corrupt/format) |
+| `clip_no_video` | 422 | a clip has no video stream |
+| `empty_clip` | 422 | concatenated video has duration 0 |
+| `probe_timeout` | 504 | ffprobe hung reading a clip |
+| `ffmpeg_timeout` | 504 | ffmpeg hung during concat/mix |
+| `render_failed` | 500 | ffmpeg exited non-zero (processing failure) |
+| `internal_error` | 500 | unexpected; details only in logs |
+
+Adding a new failure mode means: add the literal to `ErrorCode` in `shared/models.py`, set it at the raise site, and add a row to `_CODE_TO_STATUS` (anything unmapped defaults to 500).
 
 ### Concat fast-path vs re-encode
 

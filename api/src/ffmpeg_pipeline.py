@@ -29,11 +29,27 @@ FFMPEG_TIMEOUT_SECONDS = 600
 
 
 class _FriendlyError(RuntimeError):
-    """Internal sentinel — message is safe to surface to Make/Airtable."""
+    """Internal sentinel — message is safe to surface to Make/Airtable.
+
+    `code` is a stable `ErrorCode` (see shared.models) the orchestrator
+    maps to an HTTP status; the message stays Spanish and free to reword.
+    """
+
+    def __init__(self, message: str, *, code: str = "render_failed") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class FfmpegError(RuntimeError):
-    """Raised when ffmpeg/ffprobe fails. Message is user-readable."""
+    """Raised when ffmpeg/ffprobe fails. Message is user-readable.
+
+    Carries the same stable `code` so `run_pipeline` can re-raise it as a
+    `_FriendlyError` without re-classifying.
+    """
+
+    def __init__(self, message: str, *, code: str = "render_failed") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # ---------------------------------------------------------------------------
@@ -93,19 +109,26 @@ def probe(path: str) -> VideoInfo:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
     except subprocess.TimeoutExpired as exc:
-        raise FfmpegError(f"ffprobe colgado leyendo {os.path.basename(path)}.") from exc
+        raise FfmpegError(
+            f"ffprobe colgado leyendo {os.path.basename(path)}.",
+            code="probe_timeout",
+        ) from exc
     except subprocess.CalledProcessError as exc:
         logger.error("ffprobe_failed", extra={"stderr": exc.stderr, "path": path})
         raise FfmpegError(
             f"ffprobe no pudo leer {os.path.basename(path)} — el archivo está "
-            f"corrupto o el formato no es compatible."
+            f"corrupto o el formato no es compatible.",
+            code="clip_unreadable",
         ) from exc
 
     data = json.loads(proc.stdout or "{}")
     v_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
     a_stream = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
     if v_stream is None:
-        raise FfmpegError(f"{os.path.basename(path)} no contiene stream de vídeo.")
+        raise FfmpegError(
+            f"{os.path.basename(path)} no contiene stream de vídeo.",
+            code="clip_no_video",
+        )
 
     fmt = data.get("format", {})
     duration = float(fmt.get("duration") or v_stream.get("duration") or 0.0)
@@ -316,7 +339,8 @@ def run(cmd: list[str], *, friendly_action: str, timeout: int | None = None) -> 
         logger.error("ffmpeg_timeout", extra={"action": friendly_action, "cmd": cmd[:3]})
         raise FfmpegError(
             f"FFmpeg colgado al {friendly_action} (timeout {t}s). "
-            f"Probable problema con un clip muy largo o un archivo corrupto."
+            f"Probable problema con un clip muy largo o un archivo corrupto.",
+            code="ffmpeg_timeout",
         ) from exc
 
     if proc.returncode != 0:
@@ -374,7 +398,7 @@ def run_pipeline(
     try:
         infos = [probe(p) for p in ordered_paths]
     except FfmpegError as exc:
-        raise _FriendlyError(str(exc)) from exc
+        raise _FriendlyError(str(exc), code=exc.code) from exc
 
     # ---- 2. Concat ----
     # With no music, the concat IS the final output (clips carry their own
@@ -389,7 +413,7 @@ def run_pipeline(
         try:
             run(cmd, friendly_action="concatenar los clips")
         except FfmpegError as exc:
-            raise _FriendlyError(str(exc)) from exc
+            raise _FriendlyError(str(exc), code=exc.code) from exc
         concat_strategy: Literal["fast", "reencode"] = "fast"
     else:
         log.info("concat_reencode_path", strategy=settings.orientation_strategy)
@@ -402,20 +426,23 @@ def run_pipeline(
         try:
             run(cmd, friendly_action="normalizar y concatenar los clips")
         except FfmpegError as exc:
-            raise _FriendlyError(str(exc)) from exc
+            raise _FriendlyError(str(exc), code=exc.code) from exc
         concat_strategy = "reencode"
 
     # ---- 3. Probe concat for duration + audio presence ----
     try:
         concat_info = probe(str(concat_path))
     except FfmpegError as exc:
+        # Probing our OWN concat output failed → a render fault, not bad input.
         raise _FriendlyError(
-            f"No pude leer el vídeo concatenado para calcular su duración — {exc}"
+            f"No pude leer el vídeo concatenado para calcular su duración — {exc}",
+            code="render_failed",
         ) from exc
     duration = concat_info.duration
     if duration <= 0:
         raise _FriendlyError(
-            "El vídeo concatenado tiene duración 0 — uno de los clips está vacío."
+            "El vídeo concatenado tiene duración 0 — uno de los clips está vacío.",
+            code="empty_clip",
         )
 
     # ---- 4. Mix music (skipped when clips are pre-edited with their audio) ----
@@ -438,6 +465,6 @@ def run_pipeline(
     try:
         run(mix_cmd, friendly_action="mezclar la música con el vídeo")
     except FfmpegError as exc:
-        raise _FriendlyError(str(exc)) from exc
+        raise _FriendlyError(str(exc), code=exc.code) from exc
 
     return PipelineResult(duration_seconds=round(duration, 2), concat_strategy=concat_strategy)
