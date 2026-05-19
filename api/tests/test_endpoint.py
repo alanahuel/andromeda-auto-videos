@@ -101,6 +101,60 @@ def test_post_jobs_succeeds_without_music_and_passes_none_to_pipeline():
     assert captured["music"] is None
 
 
+def test_post_jobs_accepts_two_clips_and_forwards_only_those_paths():
+    """Any 2-of-3 subset must work; clip paths reach the pipeline in role order."""
+    captured: dict = {}
+
+    def _capturing_pipeline(*, output: Path, clips, **_kwargs) -> PipelineResult:
+        captured["clip_names"] = [p.name for p in clips]
+        output.write_bytes(_FAKE_MP4)
+        return PipelineResult(duration_seconds=8.0, concat_strategy="reencode")
+
+    files = {
+        "clip_hook": ("hook.mp4", b"hook-bytes", "video/mp4"),
+        "clip_cta": ("cta.mp4", b"cta-bytes", "video/mp4"),
+    }
+
+    with patch("src.render_orchestrator.run_pipeline", side_effect=_capturing_pipeline):
+        resp = client.post(
+            "/jobs",
+            headers={"X-API-Key": API_KEY},
+            data={"params": _params()},
+            files=files,
+        )
+
+    assert resp.status_code == 200
+    # Order preserved (hook before cta), cuerpo skipped because it wasn't uploaded.
+    assert captured["clip_names"] == ["hook.mp4", "cta.mp4"]
+
+
+def test_post_jobs_422_when_fewer_than_two_clips():
+    files = {
+        "clip_hook": ("hook.mp4", b"hook-bytes", "video/mp4"),
+    }
+    resp = client.post(
+        "/jobs",
+        headers={"X-API-Key": API_KEY},
+        data={"params": _params()},
+        files=files,
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["code"] == "invalid_params"
+    assert "al menos 2" in body["error"]
+    assert resp.headers["x-status-code"] == "invalid_params"
+
+
+def test_post_jobs_422_when_no_clips_uploaded():
+    resp = client.post(
+        "/jobs",
+        headers={"X-API-Key": API_KEY},
+        data={"params": _params()},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "invalid_params"
+
+
 def test_post_jobs_rejects_missing_api_key():
     resp = client.post(
         "/jobs",

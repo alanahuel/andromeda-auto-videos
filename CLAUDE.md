@@ -51,12 +51,12 @@ There is no lint/format tool configured.
 
 ## Architecture
 
-The service receives a Make.com multipart POST with 3 clip files + an optional music file, assembles a video ad with ffmpeg in-process, and streams the MP4 back in the HTTP response. When `music` is omitted the clips are treated as pre-edited with their own audio: the concat is written straight to the output and the mix step is skipped (existing audio passes through untouched — `fade_in`/`fade_out` then don't apply). Single container — no queue, no callbacks, no external storage.
+The service receives a Make.com multipart POST with up to 3 clip files (any subset of `clip_hook`/`clip_cuerpo`/`clip_cta`, **minimum 2** in role order) plus an optional music file, assembles a video ad with ffmpeg in-process, and streams the MP4 back in the HTTP response. When `music` is omitted the clips are treated as pre-edited with their own audio: the concat is written straight to the output and the mix step is skipped (existing audio passes through untouched — `fade_in`/`fade_out` then don't apply). Single container — no queue, no callbacks, no external storage.
 
 ### Request lifecycle
 
-1. `POST /jobs` (api/src/main.py) — auth via `X-API-Key`, parses the multipart, validates `params` against `JobParams` (Pydantic, `extra="forbid"`, orientation literal, regex on `output_name`).
-2. `render_sync` (api/src/render_orchestrator.py) acquires the module-level `asyncio.Semaphore(1)`, persists the three clip `UploadFile`s (plus `music` if present) into a per-job tmp workdir (`/tmp/render_<uuid>_*/`), passing `music=None` to the pipeline when no music file was uploaded, and dispatches the sync pipeline via `asyncio.to_thread` so the event loop stays responsive for `/health`.
+1. `POST /jobs` (api/src/main.py) — auth via `X-API-Key`, parses the multipart, validates `params` against `JobParams` (Pydantic, `extra="forbid"`, orientation literal, regex on `output_name`). All three clip fields are optional; the endpoint collects whichever subset was uploaded in role order (hook → cuerpo → cta) and rejects the request with `invalid_params` if fewer than 2 arrived.
+2. `render_sync` (api/src/render_orchestrator.py) acquires the module-level `asyncio.Semaphore(1)`, persists each uploaded clip `UploadFile` into a per-job tmp workdir (`/tmp/render_<uuid>_*/`) using the role as the filename (`hook.mp4`, `cuerpo.mp4`, `cta.mp4`), plus `music` if present, passing `music=None` to the pipeline when no music file was uploaded, and dispatches the sync pipeline via `asyncio.to_thread` so the event loop stays responsive for `/health`. It forwards `clips: list[Path]` to `run_pipeline` in role order — the pipeline never sees the role names.
 3. `run_pipeline` (api/src/ffmpeg_pipeline.py) runs the strict sequence: ffprobe each clip → decide fast-path vs re-encode → concat → ffprobe the concat → mix music (skipped when `music is None`; concat is written directly to the output instead) → write the output MP4 inside the workdir. Returns a `PipelineResult(duration_seconds, concat_strategy)`.
 4. The orchestrator reads the output bytes into memory (clips < 200 MB by ops note), returns them via `StreamingResponse`, and cleans the workdir in `finally`.
 
@@ -85,15 +85,15 @@ Adding a new failure mode means: add the literal to `ErrorCode` in `shared/model
 
 ### Concat fast-path vs re-encode
 
-`ffmpeg_pipeline.can_concat_without_reencode` returns true only when all three clips share codec, width/height, fps, audio codec, sample rate, AND match the requested `orientation`. If true, the pipeline uses ffmpeg's concat demuxer with `-c copy` (seconds). Otherwise it builds a `-filter_complex` graph that per-clip scales+crops/pads to 1080×1920 (vertical) or 1920×1080 (horizontal) at 30 fps, then concats. The strategy (`crop` vs `pad`) is controlled by `ORIENTATION_STRATEGY`. The chosen strategy is reflected back in the response header `X-Concat-Strategy: fast|reencode`. The per-render UUID generated in `render_sync` is also surfaced as `X-Job-Id` so callers can correlate logs with the response.
+`ffmpeg_pipeline.can_concat_without_reencode` returns true only when all uploaded clips share codec, width/height, fps, audio codec, sample rate, AND match the requested `orientation`. If true, the pipeline uses ffmpeg's concat demuxer with `-c copy` (seconds). Otherwise it builds a `-filter_complex` graph that per-clip scales+crops/pads to 1080×1920 (vertical) or 1920×1080 (horizontal) at 30 fps, then concats with `concat=n=<len(clips)>`. The strategy (`crop` vs `pad`) is controlled by `ORIENTATION_STRATEGY`. The chosen strategy is reflected back in the response header `X-Concat-Strategy: fast|reencode`. The per-render UUID generated in `render_sync` is also surfaced as `X-Job-Id` so callers can correlate logs with the response.
 
 ### Silent clips
 
-When a clip has no audio stream, the re-encode path injects a `lavfi anullsrc` input of matching duration as that clip's audio slot — so the `concat=` filter always sees 3 video+audio pairs. The music-mix step has a separate branch for the rare case the entire concat ended up audio-less.
+When a clip has no audio stream, the re-encode path injects a `lavfi anullsrc` input of matching duration as that clip's audio slot — so the `concat=` filter always sees N video+audio pairs (one per uploaded clip). The music-mix step has a separate branch for the rare case the entire concat ended up audio-less.
 
 ### Shared models contract
 
-`shared/models.py` is the single source of truth for the wire format. The Dockerfile `COPY shared /app/shared`. Changing this file requires rebuilding the image. The `JobParams` model is the JSON payload of the multipart `params` field — there is no support for clip role overrides; the three clips are always supplied as the named multipart fields `clip_hook`, `clip_cuerpo`, `clip_cta`.
+`shared/models.py` is the single source of truth for the wire format. The Dockerfile `COPY shared /app/shared`. Changing this file requires rebuilding the image. The `JobParams` model is the JSON payload of the multipart `params` field — there is no support for clip role overrides; clips are supplied as the named multipart fields `clip_hook`, `clip_cuerpo`, `clip_cta`. All three are optional but the request must include at least 2 of them; concat order matches the role order hook → cuerpo → cta regardless of which clips were uploaded.
 
 ### Settings
 

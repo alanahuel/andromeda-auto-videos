@@ -215,9 +215,19 @@ def test_concat_reencode_adds_silent_lavfi_for_clip_without_audio():
     assert "[3:a]aresample=48000" in fc
 
 
-def test_concat_reencode_requires_exactly_three_clips():
+def test_concat_reencode_requires_at_least_two_clips():
     with pytest.raises(ValueError):
-        build_concat_reencode_cmd([_info(), _info()], "/tmp/out.mp4", "vertical", "crop")
+        build_concat_reencode_cmd([_info()], "/tmp/out.mp4", "vertical", "crop")
+
+
+def test_concat_reencode_supports_two_clips():
+    infos = [_info(), _info()]
+    cmd = build_concat_reencode_cmd(infos, "/tmp/out.mp4", "vertical", "crop")
+    fc = cmd[cmd.index("-filter_complex") + 1]
+    assert "concat=n=2:v=1:a=1" in fc
+    # Only two [vN][aN] pairs feed the concat filter.
+    assert "[v0][a0][v1][a1]concat=n=2" in fc
+    assert "[v2]" not in fc and "[a2]" not in fc
 
 
 # ---------------------------------------------------------------------------

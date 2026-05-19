@@ -227,18 +227,19 @@ def build_concat_reencode_cmd(
     strategy: Literal["crop", "pad"],
 ) -> list[str]:
     """Normalised re-encode + concat. Per-clip silent lavfi audio is injected
-    when a clip has no audio stream, so the `concat=` filter always sees 3
-    video+audio pairs.
+    when a clip has no audio stream, so the `concat=` filter always sees N
+    video+audio pairs (N = len(infos), at least 2).
     """
-    if len(infos) != 3:
-        raise ValueError("expected exactly 3 clips for concat")
+    n = len(infos)
+    if n < 2:
+        raise ValueError("expected at least 2 clips for concat")
 
     cmd: list[str] = ["ffmpeg", "-y"]
     for info in infos:
         cmd += ["-i", info.path]
 
     silent_input_for: dict[int, int] = {}
-    next_input_idx = len(infos)
+    next_input_idx = n
     for i, info in enumerate(infos):
         if not info.has_audio:
             cmd += [
@@ -252,12 +253,13 @@ def build_concat_reencode_cmd(
     vf = _per_clip_video_filter(target_orientation, strategy)
 
     parts: list[str] = []
-    for i in range(3):
+    for i in range(n):
         parts.append(f"[{i}:v]{vf}[v{i}]")
-    for i, info in enumerate(infos):
+    for i in range(n):
         audio_input = silent_input_for.get(i, i)
         parts.append(f"[{audio_input}:a]aresample=48000,asetpts=PTS-STARTPTS[a{i}]")
-    parts.append("[v0][a0][v1][a1][v2][a2]concat=n=3:v=1:a=1[v][a]")
+    concat_pairs = "".join(f"[v{i}][a{i}]" for i in range(n))
+    parts.append(f"{concat_pairs}concat=n={n}:v=1:a=1[v][a]")
     filter_complex = ";".join(parts)
 
     cmd += [
@@ -370,14 +372,16 @@ class PipelineResult:
 
 def run_pipeline(
     *,
-    hook: Path,
-    cuerpo: Path,
-    cta: Path,
+    clips: list[Path],
     music: Path | None,
     output: Path,
     params: JobParams,
 ) -> PipelineResult:
     """Probe → concat (fast or re-encode) → mix music (if any) → write output.
+
+    `clips` is the ordered list of clip paths to concatenate (typically the
+    subset of hook/cuerpo/cta the caller actually uploaded, in that role
+    order). Must contain at least 2 paths.
 
     When `music` is None the clips are assumed pre-edited with their own
     audio: the concat is written straight to `output` (both concat builders
@@ -393,8 +397,14 @@ def run_pipeline(
     settings = get_settings()
     workdir = output.parent
 
-    # ---- 1. Probe clips in role order: hook → cuerpo → cta ----
-    ordered_paths = [str(hook), str(cuerpo), str(cta)]
+    if len(clips) < 2:
+        raise _FriendlyError(
+            "Se requieren al menos 2 clips para concatenar.",
+            code="invalid_params",
+        )
+
+    # ---- 1. Probe clips in the order received ----
+    ordered_paths = [str(p) for p in clips]
     try:
         infos = [probe(p) for p in ordered_paths]
     except FfmpegError as exc:

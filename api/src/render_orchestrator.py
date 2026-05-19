@@ -82,12 +82,16 @@ async def _persist(upload: UploadFile, dest: Path) -> None:
 
 async def render_sync(
     *,
-    clip_hook: UploadFile,
-    clip_cuerpo: UploadFile,
-    clip_cta: UploadFile,
+    clips: list[tuple[str, UploadFile]],
     music: UploadFile | None,
     params: JobParams,
 ) -> RenderResult:
+    """Run a render given an ordered list of `(role, UploadFile)` clips.
+
+    `clips` is the subset of hook/cuerpo/cta actually uploaded, already in
+    role order (hook → cuerpo → cta). At least 2 entries are required; the
+    API layer validates that before calling.
+    """
     job_id = str(uuid.uuid4())
     structlog.contextvars.bind_contextvars(job_id=job_id, output_name=params.output_name)
     workdir = Path(tempfile.mkdtemp(prefix=f"render_{job_id}_"))
@@ -98,15 +102,15 @@ async def render_sync(
                 "job_started",
                 orientation=params.orientation,
                 has_music=music is not None,
+                clip_roles=[role for role, _ in clips],
             )
             started = time.monotonic()
 
-            hook_path = workdir / "hook.mp4"
-            cuerpo_path = workdir / "cuerpo.mp4"
-            cta_path = workdir / "cta.mp4"
-            await _persist(clip_hook, hook_path)
-            await _persist(clip_cuerpo, cuerpo_path)
-            await _persist(clip_cta, cta_path)
+            clip_paths: list[Path] = []
+            for role, upload in clips:
+                dest = workdir / f"{role}.mp4"
+                await _persist(upload, dest)
+                clip_paths.append(dest)
 
             music_path: Path | None = None
             if music is not None:
@@ -117,9 +121,7 @@ async def render_sync(
 
             pipeline_result = await asyncio.to_thread(
                 run_pipeline,
-                hook=hook_path,
-                cuerpo=cuerpo_path,
-                cta=cta_path,
+                clips=clip_paths,
                 music=music_path,
                 output=output_path,
                 params=params,

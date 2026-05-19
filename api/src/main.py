@@ -42,9 +42,9 @@ def health() -> dict[str, str]:
 
 @app.post("/jobs", dependencies=[Depends(require_api_key)])
 async def create_job(
-    clip_hook: UploadFile = File(...),
-    clip_cuerpo: UploadFile = File(...),
-    clip_cta: UploadFile = File(...),
+    clip_hook: UploadFile | None = File(None),
+    clip_cuerpo: UploadFile | None = File(None),
+    clip_cta: UploadFile | None = File(None),
     music: UploadFile | None = File(None),
     params: str = Form(...),
 ):
@@ -61,11 +61,35 @@ async def create_job(
             headers={"X-Status-Code": "invalid_params"},
         )
 
+    # Any subset of hook/cuerpo/cta is allowed, in that order, as long as at
+    # least 2 clips arrive — concatenating a single clip is a no-op.
+    clips: list[tuple[str, UploadFile]] = [
+        (role, upload)
+        for role, upload in (
+            ("hook", clip_hook),
+            ("cuerpo", clip_cuerpo),
+            ("cta", clip_cta),
+        )
+        if upload is not None
+    ]
+    if len(clips) < 2:
+        return JSONResponse(
+            status_code=422,
+            content=ErrorResponse(
+                error=(
+                    "Se requieren al menos 2 clips (hook/cuerpo/cta) para "
+                    "concatenar; recibí "
+                    f"{len(clips)}."
+                ),
+                code="invalid_params",
+                job_id=None,
+            ).model_dump(),
+            headers={"X-Status-Code": "invalid_params"},
+        )
+
     try:
         result = await render_sync(
-            clip_hook=clip_hook,
-            clip_cuerpo=clip_cuerpo,
-            clip_cta=clip_cta,
+            clips=clips,
             music=music,
             params=job_params,
         )
