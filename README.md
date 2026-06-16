@@ -1,6 +1,6 @@
 # Andromeda render-service
 
-Servicio que ensambla anuncios de vídeo a partir de tres clips raw (Hook + Cuerpo + CTA) y una pista de música. Está pensado para ser disparado por Make.com como parte del pipeline de Andrómeda: Make envía los cuatro archivos vía `multipart/form-data` y recibe el MP4 ensamblado en la misma respuesta HTTP. **Síncrono y sin estado externo.**
+Servicio que ensambla anuncios de vídeo a partir de hasta tres clips raw (Hook + Cuerpo + CTA) y, opcionalmente, una pista de música. Acepta cualquier subconjunto desde 1 clip: con 2+ los concatena, con uno solo le mezcla la música encima. Está pensado para ser disparado por Make.com como parte del pipeline de Andrómeda: Make envía los archivos vía `multipart/form-data` y recibe el MP4 ensamblado en la misma respuesta HTTP. **Síncrono y sin estado externo.**
 
 ## Arquitectura
 
@@ -104,6 +104,14 @@ curl -s -X POST http://localhost:8000/jobs \
   -F "music=@music.mp3" \
   -F 'params={"orientation":"vertical","music_volume":0.3,"fade_in":2,"fade_out":2,"output_name":"smoke_test"}' \
   -o out.mp4 -D headers.txt
+
+# Una sola pieza + música (cualquiera de clip_hook/clip_cuerpo/clip_cta): sin concat, solo se le mezcla la música
+curl -s -X POST http://localhost:8000/jobs \
+  -H "X-API-Key: $RENDER_API_KEY" \
+  -F "clip_cuerpo=@una_pieza.mp4" \
+  -F "music=@music.mp3" \
+  -F 'params={"orientation":"vertical","music_volume":0.3,"fade_in":2,"fade_out":2,"output_name":"una_pieza"}' \
+  -o out.mp4 -D headers.txt
 ```
 
 Si todo va bien: respuesta `200 OK` con `Content-Type: video/mp4` y los headers extra `X-Job-Id`, `X-Output-Duration-Seconds` y `X-Concat-Strategy: fast|reencode`. El MP4 cae en `out.mp4`.
@@ -123,10 +131,12 @@ Content-Type: `multipart/form-data`. Campos:
 
 | Campo         | Tipo    | Notas                                                |
 |---------------|---------|------------------------------------------------------|
-| `clip_hook`   | file    | MP4                                                  |
-| `clip_cuerpo` | file    | MP4                                                  |
-| `clip_cta`    | file    | MP4                                                  |
+| `clip_hook`   | file    | MP4 — opcional                                       |
+| `clip_cuerpo` | file    | MP4 — opcional                                       |
+| `clip_cta`    | file    | MP4 — opcional                                       |
 | `music`       | file    | MP3 / M4A / WAV — libavformat sniff lo resuelve      |
+
+Los tres campos de clip son opcionales pero **debe llegar al menos 1**. Con 2+ clips se concatenan en orden hook → cuerpo → cta. Con un solo clip no hay nada que concatenar, pero igual pasa por el pipeline para normalizar la orientación y, si mandas `music`, mezclarle la música encima — el caso de "súbeme una sola pieza y ponle música".
 | `params`      | string  | JSON serializado de `JobParams` (ver `shared/models.py`) |
 
 Schema de `params`:
@@ -154,7 +164,7 @@ Schema de `params`:
 ### Response — error
 
 - `401` si falta o no coincide el `X-API-Key`.
-- `422` si `params` no parsea o no cumple el schema.
+- `422` si `params` no parsea, no cumple el schema, o no llega ningún clip.
 - `500` con body JSON `{"error": "<mensaje en español>"}` si el render falla. Los errores conocidos llevan el mensaje original (en español, seguro de mostrar a usuario). Los inesperados se ofuscan como `"Error inesperado en el render — revisa los logs del servicio."`.
 
 ## Logs

@@ -228,11 +228,12 @@ def build_concat_reencode_cmd(
 ) -> list[str]:
     """Normalised re-encode + concat. Per-clip silent lavfi audio is injected
     when a clip has no audio stream, so the `concat=` filter always sees N
-    video+audio pairs (N = len(infos), at least 2).
+    video+audio pairs (N = len(infos), at least 1). With a single clip
+    `concat=n=1` is a no-op that still applies the orientation normalisation.
     """
     n = len(infos)
-    if n < 2:
-        raise ValueError("expected at least 2 clips for concat")
+    if n < 1:
+        raise ValueError("expected at least 1 clip for concat")
 
     cmd: list[str] = ["ffmpeg", "-y"]
     for info in infos:
@@ -381,7 +382,10 @@ def run_pipeline(
 
     `clips` is the ordered list of clip paths to concatenate (typically the
     subset of hook/cuerpo/cta the caller actually uploaded, in that role
-    order). Must contain at least 2 paths.
+    order). Must contain at least 1 path. With a single clip there is nothing
+    to concatenate, but it still flows through the concat step (a `-c copy`
+    pass on the fast-path, a normalising re-encode otherwise) so the output
+    is consistent and music can be mixed onto it.
 
     When `music` is None the clips are assumed pre-edited with their own
     audio: the concat is written straight to `output` (both concat builders
@@ -397,9 +401,9 @@ def run_pipeline(
     settings = get_settings()
     workdir = output.parent
 
-    if len(clips) < 2:
+    if len(clips) < 1:
         raise _FriendlyError(
-            "Se requieren al menos 2 clips para concatenar.",
+            "Se requiere al menos 1 clip.",
             code="invalid_params",
         )
 

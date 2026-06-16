@@ -45,18 +45,26 @@ curl -s -X POST http://localhost:8000/jobs \
   -F "music=@music.mp3" \
   -F 'params={"orientation":"vertical","music_volume":0.3,"fade_in":2,"fade_out":2,"output_name":"smoke_test"}' \
   -o out.mp4 -D -
+
+# Single clip + music (any one of clip_hook/clip_cuerpo/clip_cta): no concat, just mix music onto it
+curl -s -X POST http://localhost:8000/jobs \
+  -H "X-API-Key: $RENDER_API_KEY" \
+  -F "clip_cuerpo=@una_pieza.mp4" \
+  -F "music=@music.mp3" \
+  -F 'params={"orientation":"vertical","music_volume":0.3,"fade_in":2,"fade_out":2,"output_name":"una_pieza"}' \
+  -o out.mp4 -D -
 ```
 
 There is no lint/format tool configured.
 
 ## Architecture
 
-The service receives a Make.com multipart POST with up to 3 clip files (any subset of `clip_hook`/`clip_cuerpo`/`clip_cta`, **minimum 2** in role order) plus an optional music file, assembles a video ad with ffmpeg in-process, and streams the MP4 back in the HTTP response. When `music` is omitted the clips are treated as pre-edited with their own audio: the concat is written straight to the output and the mix step is skipped (existing audio passes through untouched — `fade_in`/`fade_out` then don't apply). Single container — no queue, no callbacks, no external storage.
+The service receives a Make.com multipart POST with up to 3 clip files (any subset of `clip_hook`/`clip_cuerpo`/`clip_cta`, **minimum 1** in role order) plus an optional music file, assembles a video ad with ffmpeg in-process, and streams the MP4 back in the HTTP response. With 2+ clips they are concatenated; with a single clip there is nothing to concat but it still flows through the concat step (a `-c copy` pass on the fast-path, a normalising re-encode otherwise) so music can be mixed onto it — useful when the team wants to drop music on one finished piece. When `music` is omitted the clips are treated as pre-edited with their own audio: the concat is written straight to the output and the mix step is skipped (existing audio passes through untouched — `fade_in`/`fade_out` then don't apply). Single container — no queue, no callbacks, no external storage.
 
 ### Request lifecycle
 
-1. `POST /jobs` (api/src/main.py) — auth via `X-API-Key`, parses the multipart, validates `params` against `JobParams` (Pydantic, `extra="forbid"`, orientation literal, regex on `output_name`). All three clip fields are optional; the endpoint collects whichever subset was uploaded in role order (hook → cuerpo → cta) and rejects the request with `invalid_params` if fewer than 2 arrived.
-2. `render_sync` (api/src/render_orchestrator.py) acquires the module-level `asyncio.Semaphore(1)`, persists each uploaded clip `UploadFile` into a per-job tmp workdir (`/tmp/render_<uuid>_*/`) using the role as the filename (`hook.mp4`, `cuerpo.mp4`, `cta.mp4`), plus `music` if present, passing `music=None` to the pipeline when no music file was uploaded, and dispatches the sync pipeline via `asyncio.to_thread` so the event loop stays responsive for `/health`. It forwards `clips: list[Path]` to `run_pipeline` in role order — the pipeline never sees the role names.
+1. `POST /jobs` (api/src/main.py) — auth via `X-API-Key`, parses the multipart, validates `params` against `JobParams` (Pydantic, `extra="forbid"`, orientation literal, regex on `output_name`). All three clip fields are optional; the endpoint collects whichever subset was uploaded in role order (hook → cuerpo → cta) and rejects the request with `invalid_params` only if none arrived (minimum 1).
+2. `render_sync` (api/src/render_orchestrator.py) acquires the module-level `asyncio.Semaphore(1)`, persists each uploaded clip `UploadFile` into a per-job tmp workdir (`/tmp/render_<uuid>_*/`) using the role as the filename (`hook.mp4`, `cuerpo.mp4`, `cta.mp4`), plus `music` if present, passing `music=None` to the pipeline when no music file was uploaded, and dispatches the sync pipeline via `asyncio.to_thread` so the event loop stays responsive for `/health`. It forwards `clips: list[Path]` to `run_pipeline` in role order (1 or more) — the pipeline never sees the role names.
 3. `run_pipeline` (api/src/ffmpeg_pipeline.py) runs the strict sequence: ffprobe each clip → decide fast-path vs re-encode → concat → ffprobe the concat → mix music (skipped when `music is None`; concat is written directly to the output instead) → write the output MP4 inside the workdir. Returns a `PipelineResult(duration_seconds, concat_strategy)`.
 4. The orchestrator reads the output bytes into memory (clips < 200 MB by ops note), returns them via `StreamingResponse`, and cleans the workdir in `finally`.
 
@@ -93,7 +101,7 @@ When a clip has no audio stream, the re-encode path injects a `lavfi anullsrc` i
 
 ### Shared models contract
 
-`shared/models.py` is the single source of truth for the wire format. The Dockerfile `COPY shared /app/shared`. Changing this file requires rebuilding the image. The `JobParams` model is the JSON payload of the multipart `params` field — there is no support for clip role overrides; clips are supplied as the named multipart fields `clip_hook`, `clip_cuerpo`, `clip_cta`. All three are optional but the request must include at least 2 of them; concat order matches the role order hook → cuerpo → cta regardless of which clips were uploaded.
+`shared/models.py` is the single source of truth for the wire format. The Dockerfile `COPY shared /app/shared`. Changing this file requires rebuilding the image. The `JobParams` model is the JSON payload of the multipart `params` field — there is no support for clip role overrides; clips are supplied as the named multipart fields `clip_hook`, `clip_cuerpo`, `clip_cta`. All three are optional but the request must include at least 1 of them; concat order matches the role order hook → cuerpo → cta regardless of which clips were uploaded.
 
 ### Settings
 

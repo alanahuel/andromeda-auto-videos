@@ -215,9 +215,29 @@ def test_concat_reencode_adds_silent_lavfi_for_clip_without_audio():
     assert "[3:a]aresample=48000" in fc
 
 
-def test_concat_reencode_requires_at_least_two_clips():
+def test_concat_reencode_requires_at_least_one_clip():
     with pytest.raises(ValueError):
-        build_concat_reencode_cmd([_info()], "/tmp/out.mp4", "vertical", "crop")
+        build_concat_reencode_cmd([], "/tmp/out.mp4", "vertical", "crop")
+
+
+def test_concat_reencode_supports_single_clip():
+    """A single clip re-encodes through concat=n=1 (orientation normalisation)."""
+    cmd = build_concat_reencode_cmd([_info()], "/tmp/out.mp4", "vertical", "crop")
+    fc = cmd[cmd.index("-filter_complex") + 1]
+    assert "concat=n=1:v=1:a=1" in fc
+    assert "[v0][a0]concat=n=1" in fc
+    # No second clip leaks into the graph.
+    assert "[v1]" not in fc and "[a1]" not in fc
+
+
+def test_concat_reencode_single_clip_without_audio_injects_silence():
+    cmd = build_concat_reencode_cmd(
+        [_info(acodec=None, sr=None, duration=7.0)], "/tmp/out.mp4", "vertical", "crop"
+    )
+    assert "anullsrc=channel_layout=stereo:sample_rate=48000" in cmd
+    fc = cmd[cmd.index("-filter_complex") + 1]
+    # The lone clip is input 0; its silent audio is the next input (index 1).
+    assert "[1:a]aresample=48000" in fc
 
 
 def test_concat_reencode_supports_two_clips():

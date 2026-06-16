@@ -128,21 +128,34 @@ def test_post_jobs_accepts_two_clips_and_forwards_only_those_paths():
     assert captured["clip_names"] == ["hook.mp4", "cta.mp4"]
 
 
-def test_post_jobs_422_when_fewer_than_two_clips():
+def test_post_jobs_accepts_single_clip_with_music():
+    """A single clip + music is valid: nothing to concat, music mixes onto it."""
+    captured: dict = {}
+
+    def _capturing_pipeline(*, output: Path, clips, music, **_kwargs) -> PipelineResult:
+        captured["clip_names"] = [p.name for p in clips]
+        captured["has_music"] = music is not None
+        output.write_bytes(_FAKE_MP4)
+        return PipelineResult(duration_seconds=15.0, concat_strategy="fast")
+
     files = {
-        "clip_hook": ("hook.mp4", b"hook-bytes", "video/mp4"),
+        "clip_cuerpo": ("cuerpo.mp4", b"cuerpo-bytes", "video/mp4"),
+        "music": ("music.mp3", b"music-bytes", "audio/mpeg"),
     }
-    resp = client.post(
-        "/jobs",
-        headers={"X-API-Key": API_KEY},
-        data={"params": _params()},
-        files=files,
-    )
-    assert resp.status_code == 422
-    body = resp.json()
-    assert body["code"] == "invalid_params"
-    assert "al menos 2" in body["error"]
-    assert resp.headers["x-status-code"] == "invalid_params"
+
+    with patch("src.render_orchestrator.run_pipeline", side_effect=_capturing_pipeline):
+        resp = client.post(
+            "/jobs",
+            headers={"X-API-Key": API_KEY},
+            data={"params": _params()},
+            files=files,
+        )
+
+    assert resp.status_code == 200
+    assert resp.content == _FAKE_MP4
+    # Only the single uploaded clip reaches the pipeline, music alongside it.
+    assert captured["clip_names"] == ["cuerpo.mp4"]
+    assert captured["has_music"] is True
 
 
 def test_post_jobs_422_when_no_clips_uploaded():

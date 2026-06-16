@@ -61,8 +61,9 @@ async def create_job(
             headers={"X-Status-Code": "invalid_params"},
         )
 
-    # Any subset of hook/cuerpo/cta is allowed, in that order, as long as at
-    # least 2 clips arrive — concatenating a single clip is a no-op.
+    # Any subset of hook/cuerpo/cta is allowed, in that order. At least 1 clip
+    # must arrive: with a single clip there is nothing to concatenate, but the
+    # clip still flows through the pipeline so music can be mixed onto it.
     clips: list[tuple[str, UploadFile]] = [
         (role, upload)
         for role, upload in (
@@ -72,14 +73,13 @@ async def create_job(
         )
         if upload is not None
     ]
-    if len(clips) < 2:
+    if len(clips) < 1:
         return JSONResponse(
             status_code=422,
             content=ErrorResponse(
                 error=(
-                    "Se requieren al menos 2 clips (hook/cuerpo/cta) para "
-                    "concatenar; recibí "
-                    f"{len(clips)}."
+                    "Se requiere al menos 1 clip (hook/cuerpo/cta); "
+                    "no recibí ninguno."
                 ),
                 code="invalid_params",
                 job_id=None,
