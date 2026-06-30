@@ -1,14 +1,13 @@
-"""Sync render orchestrator.
+"""Async render orchestrator.
 
-Wraps the FFmpeg pipeline in an asyncio.Semaphore so only one render runs
-at a time (FFmpeg is CPU-bound and the VPS has 2 vCPU). The pipeline
-itself is synchronous; we await it via asyncio.to_thread so the event
-loop stays responsive for /health while a render is in flight.
-
-UploadFiles are streamed to a per-job tmp workdir, the pipeline writes
-the output MP4 inside that workdir, we read it into memory, and the
-workdir is removed in `finally`. The caller receives an async iterator
-that yields the bytes once.
+`POST /jobs` calls `enqueue_job`: it persists the uploaded clips + optional
+music into a per-job tmp workdir, registers a `queued` job, and returns the
+job_id immediately. The endpoint then schedules `execute_job` as a background
+task. `execute_job` acquires the module-level Semaphore(1) (FFmpeg is
+CPU-bound; the VPS has 2 vCPU), runs the synchronous pipeline via
+asyncio.to_thread so the event loop stays responsive for /health and polling,
+and records the outcome on the job. The MP4 stays on disk at `output_path` and
+is served by GET /jobs/{id}/result; the reaper purges workdirs after the TTL.
 """
 from __future__ import annotations
 
@@ -17,22 +16,24 @@ import shutil
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
 
 import structlog
 from fastapi import UploadFile
 
 from shared.models import ErrorCode, JobParams
 
+from . import job_registry
 from .ffmpeg_pipeline import _FriendlyError, run_pipeline
 
 
 log = structlog.get_logger("render-api")
 
-# Serialise renders: FFmpeg is CPU-bound; one job at a time matches WORKER_CONCURRENCY=1.
+# Serialise renders: FFmpeg is CPU-bound; one job at a time matches WORKER=1.
 _render_lock = asyncio.Semaphore(1)
+
+# After a successful download, keep the workdir alive this long for Make retries.
+DOWNLOAD_GRACE_SECONDS = 60
 
 # Stable error code → HTTP status. Anything not listed is a server fault (500).
 _CODE_TO_STATUS: dict[str, int] = {
@@ -44,6 +45,9 @@ _CODE_TO_STATUS: dict[str, int] = {
     "ffmpeg_timeout": 504,
     "render_failed": 500,
     "internal_error": 500,
+    "not_found": 404,
+    "not_ready": 409,
+    "too_busy": 429,
 }
 
 
@@ -52,11 +56,7 @@ def status_for_code(code: str) -> int:
 
 
 class RenderError(Exception):
-    """Public error surfaced to the caller. Message is safe (Spanish).
-
-    Carries the stable `code`, the mapped HTTP `http_status`, and the
-    `job_id` so the caller can correlate the failure with the logs.
-    """
+    """Public error surfaced to the caller. Message is safe (Spanish)."""
 
     def __init__(self, message: str, *, code: ErrorCode, job_id: str | None) -> None:
         super().__init__(message)
@@ -66,98 +66,125 @@ class RenderError(Exception):
         self.http_status = status_for_code(code)
 
 
-@dataclass(frozen=True)
-class RenderResult:
-    output_stream: AsyncIterator[bytes]
-    duration_seconds: float
-    concat_strategy: str
-    job_id: str
-
-
 async def _persist(upload: UploadFile, dest: Path) -> None:
     with open(dest, "wb") as fh:
         while chunk := await upload.read(1024 * 1024):
             fh.write(chunk)
 
 
-async def render_sync(
+async def enqueue_job(
     *,
     clips: list[tuple[str, UploadFile]],
     music: UploadFile | None,
     params: JobParams,
-) -> RenderResult:
-    """Run a render given an ordered list of `(role, UploadFile)` clips.
+    retention_seconds: float,
+    max_pending: int,
+) -> str:
+    """Persist uploads, register a queued job, return its id.
 
-    `clips` is the subset of hook/cuerpo/cta actually uploaded, already in
-    role order (hook → cuerpo → cta). At least 2 entries are required; the
-    API layer validates that before calling.
+    Raises RenderError(too_busy) if too many jobs are already in flight.
     """
-    job_id = str(uuid.uuid4())
-    structlog.contextvars.bind_contextvars(job_id=job_id, output_name=params.output_name)
-    workdir = Path(tempfile.mkdtemp(prefix=f"render_{job_id}_"))
+    if job_registry.pending_count() >= max_pending:
+        raise RenderError(
+            "El servicio está saturado de renders en curso. Reintenta en unos minutos.",
+            code="too_busy",
+            job_id=None,
+        )
 
+    job_id = str(uuid.uuid4())
+    workdir = Path(tempfile.mkdtemp(prefix=f"render_{job_id}_"))
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    clip_paths: list[Path] = []
+    for role, upload in clips:
+        dest = workdir / f"{role}.mp4"
+        await _persist(upload, dest)
+        clip_paths.append(dest)
+
+    music_path: Path | None = None
+    if music is not None:
+        music_path = workdir / "music"
+        await _persist(music, music_path)
+
+    output_path = workdir / f"{params.output_name}.mp4"
+
+    job_registry.create(
+        job_id,
+        output_name=params.output_name,
+        workdir=workdir,
+        output_path=output_path,
+        clip_paths=clip_paths,
+        music_path=music_path,
+        params=params,
+        retention_seconds=retention_seconds,
+    )
+    return job_id
+
+
+async def execute_job(job_id: str) -> None:
+    """Run the render for a queued job. Never raises — records outcome on the job."""
+    rec = job_registry.get(job_id)
+    if rec is None:
+        return
+
+    structlog.contextvars.bind_contextvars(job_id=job_id, output_name=rec.output_name)
     try:
         async with _render_lock:
+            job_registry.mark_processing(job_id)
             log.info(
                 "job_started",
-                orientation=params.orientation,
-                has_music=music is not None,
-                clip_roles=[role for role, _ in clips],
+                orientation=rec.params.orientation,
+                has_music=rec.music_path is not None,
+                clip_roles=[p.stem for p in rec.clip_paths],
             )
             started = time.monotonic()
 
-            clip_paths: list[Path] = []
-            for role, upload in clips:
-                dest = workdir / f"{role}.mp4"
-                await _persist(upload, dest)
-                clip_paths.append(dest)
-
-            music_path: Path | None = None
-            if music is not None:
-                music_path = workdir / "music"
-                await _persist(music, music_path)
-
-            output_path = workdir / f"{params.output_name}.mp4"
-
-            pipeline_result = await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 run_pipeline,
-                clips=clip_paths,
-                music=music_path,
-                output=output_path,
-                params=params,
+                clips=rec.clip_paths,
+                music=rec.music_path,
+                output=rec.output_path,
+                params=rec.params,
             )
 
             elapsed = round(time.monotonic() - started, 2)
+            job_registry.mark_done(
+                job_id,
+                duration_seconds=result.duration_seconds,
+                concat_strategy=result.concat_strategy,
+            )
             log.info(
                 "job_done",
-                duration_seconds=pipeline_result.duration_seconds,
-                concat_strategy=pipeline_result.concat_strategy,
+                duration_seconds=result.duration_seconds,
+                concat_strategy=result.concat_strategy,
                 elapsed_seconds=elapsed,
-            )
-
-            # Clips < 200 MB per ops note — loading into memory is acceptable
-            # and lets us clean the workdir before returning.
-            output_bytes = output_path.read_bytes()
-
-            async def stream() -> AsyncIterator[bytes]:
-                yield output_bytes
-
-            return RenderResult(
-                output_stream=stream(),
-                duration_seconds=pipeline_result.duration_seconds,
-                concat_strategy=pipeline_result.concat_strategy,
-                job_id=job_id,
             )
     except _FriendlyError as exc:
         log.error("job_failed", error=str(exc), error_code=exc.code)
-        raise RenderError(str(exc), code=exc.code, job_id=job_id) from exc
-    except Exception as exc:
+        job_registry.mark_failed(job_id, code=exc.code, error=str(exc))
+    except Exception as exc:  # noqa: BLE001 — detail goes to logs, not the caller
         log.exception("job_failed_unexpected", error_type=type(exc).__name__)
-        raise RenderError(
-            "Error inesperado en el render — revisa los logs del servicio.",
+        job_registry.mark_failed(
+            job_id,
             code="internal_error",
-            job_id=job_id,
-        ) from exc
+            error="Error inesperado en el render — revisa los logs del servicio.",
+        )
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
         structlog.contextvars.clear_contextvars()
+
+
+def reap_once(*, now: float | None = None) -> int:
+    """Delete the workdirs of all expired jobs. Returns how many were reaped."""
+    workdirs = job_registry.sweep_expired(now=now)
+    for wd in workdirs:
+        shutil.rmtree(wd, ignore_errors=True)
+    return len(workdirs)
+
+
+async def run_reaper(*, interval_seconds: float, stop: asyncio.Event) -> None:
+    """Sweep expired jobs every `interval_seconds` until `stop` is set."""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            reap_once()
