@@ -35,6 +35,9 @@ ErrorCode = Literal[
     "ffmpeg_timeout",   # 504 — ffmpeg hung during concat/mix
     "render_failed",    # 500 — ffmpeg exited non-zero (processing failure)
     "internal_error",   # 500 — unexpected, details only in logs
+    "not_found",        # 404 — job id unknown or expired/purged
+    "not_ready",        # 409 — /result requested while still queued/processing
+    "too_busy",         # 429 — pending queue full; resubmit later
 ]
 
 
@@ -59,3 +62,20 @@ class ErrorResponse(BaseModel):
     error: str
     code: ErrorCode
     job_id: str | None = None
+
+
+# Lifecycle of an async render job, surfaced by GET /jobs/{id}.
+JobStatus = Literal["queued", "processing", "done", "failed"]
+
+
+class JobStatusResponse(BaseModel):
+    """Body of GET /jobs/{id}. `code` is "ok" while healthy, the render's
+    stable ErrorCode once `status == "failed"`. The metadata fields are
+    populated only once the render is done."""
+
+    job_id: str
+    status: JobStatus
+    code: ResultCode
+    duration_seconds: float | None = None
+    concat_strategy: str | None = None
+    error: str | None = None
