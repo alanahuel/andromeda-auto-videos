@@ -93,7 +93,6 @@ async def enqueue_job(
 
     job_id = str(uuid.uuid4())
     workdir = Path(tempfile.mkdtemp(prefix=f"render_{job_id}_"))
-    workdir.mkdir(parents=True, exist_ok=True)
 
     clip_paths: list[Path] = []
     for role, upload in clips:
@@ -127,8 +126,8 @@ async def execute_job(job_id: str) -> None:
     if rec is None:
         return
 
-    structlog.contextvars.bind_contextvars(job_id=job_id, output_name=rec.output_name)
     try:
+        structlog.contextvars.bind_contextvars(job_id=job_id, output_name=rec.output_name)
         async with _render_lock:
             job_registry.mark_processing(job_id)
             log.info(

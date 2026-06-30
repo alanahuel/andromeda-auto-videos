@@ -29,8 +29,12 @@ def _clean_registry():
 
 
 def test_enqueue_persists_uploads_and_registers_queued(tmp_path, monkeypatch):
-    monkeypatch.setattr("tempfile.mkdtemp", lambda prefix: str(tmp_path / prefix))
-    Path(str(tmp_path / "render_")).mkdir(parents=True, exist_ok=True)
+    def _fake_mkdtemp(prefix):
+        d = tmp_path / prefix
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d)
+
+    monkeypatch.setattr("tempfile.mkdtemp", _fake_mkdtemp)
 
     job_id = asyncio.run(
         render_orchestrator.enqueue_job(
@@ -51,8 +55,6 @@ def test_enqueue_persists_uploads_and_registers_queued(tmp_path, monkeypatch):
 
 
 def test_enqueue_raises_too_busy_when_queue_full(tmp_path, monkeypatch):
-    monkeypatch.setattr("tempfile.mkdtemp", lambda prefix: str(tmp_path / prefix))
-    Path(str(tmp_path / "render_")).mkdir(parents=True, exist_ok=True)
     # Fill the registry with 2 queued jobs, bound = 2.
     for jid in ("a", "b"):
         wd = tmp_path / jid
@@ -148,3 +150,21 @@ def test_reap_once_deletes_expired_workdirs(tmp_path):
     assert count == 1
     assert not wd.exists()
     assert job_registry.get("old") is None
+
+
+def test_run_reaper_exits_promptly_when_stopped(monkeypatch):
+    calls = []
+    monkeypatch.setattr(render_orchestrator, "reap_once", lambda **kw: calls.append(1))
+
+    async def _run():
+        stop = asyncio.Event()
+        stop.set()  # already stopped before the loop starts
+        await asyncio.wait_for(
+            render_orchestrator.run_reaper(interval_seconds=1000, stop=stop),
+            timeout=1.0,
+        )
+
+    asyncio.run(_run())
+    # interval is 1000s but it returned within 1s → it did not block on the interval,
+    # and with stop pre-set it never reaps.
+    assert calls == []
