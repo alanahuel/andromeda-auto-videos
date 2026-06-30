@@ -146,10 +146,40 @@ def test_reap_once_deletes_expired_workdirs(tmp_path):
         clip_paths=[], music_path=None, params=_params(),
         retention_seconds=100.0, now=0.0,
     )
+    # Must be terminal for the reaper to touch it; mark done at t=0 → expires_at=100.
+    job_registry.mark_done("old", duration_seconds=1.0, concat_strategy="fast", now=0.0)
     count = render_orchestrator.reap_once(now=200.0)
     assert count == 1
     assert not wd.exists()
     assert job_registry.get("old") is None
+
+
+def test_enqueue_cleans_workdir_when_persist_fails(tmp_path, monkeypatch):
+    made = {}
+
+    def _fake_mkdtemp(prefix):
+        d = tmp_path / prefix
+        d.mkdir(parents=True, exist_ok=True)
+        made["dir"] = d
+        return str(d)
+
+    monkeypatch.setattr("tempfile.mkdtemp", _fake_mkdtemp)
+
+    async def _boom_persist(upload, dest):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(render_orchestrator, "_persist", _boom_persist)
+
+    with pytest.raises(render_orchestrator.RenderError) as ei:
+        asyncio.run(
+            render_orchestrator.enqueue_job(
+                clips=[("hook", _upload("hook.mp4", b"x"))],
+                music=None, params=_params(), retention_seconds=1800, max_pending=20,
+            )
+        )
+    assert ei.value.code == "internal_error"
+    assert ei.value.job_id is None
+    assert not made["dir"].exists()   # workdir cleaned up
 
 
 def test_run_reaper_exits_promptly_when_stopped(monkeypatch):

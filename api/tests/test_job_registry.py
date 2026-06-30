@@ -78,18 +78,47 @@ def test_pending_count_counts_queued_and_processing_only():
 
 
 def test_sweep_expired_drops_and_returns_expired_workdirs():
-    _create("old", retention=100.0, now=0.0)   # expires_at = 100
+    # "old": created at t=0, retention=100 → expires_at=100;
+    # mark_done at now=0 re-stamps expires_at = 0 + 100 = 100 (still expired at 150)
+    _create("old", retention=100.0, now=0.0)
+    job_registry.mark_done("old", duration_seconds=1.0, concat_strategy="fast", now=0.0)
+
+    # "new": mark_done at now=9900 → expires_at = 9900 + 100 = 10000 (not expired at 150)
     _create("new", retention=100.0, now=0.0)
-    job_registry.mark_processing("new")
-    job_registry.mark_done("new", duration_seconds=1.0, concat_strategy="fast")
-    # bump 'new' far into the future so only 'old' expires
-    job_registry.get("new").expires_at = 10_000.0
+    job_registry.mark_done("new", duration_seconds=1.0, concat_strategy="fast", now=9900.0)
 
     dropped = job_registry.sweep_expired(now=150.0)
 
     assert [p.name for p in dropped] == ["render_old"]
     assert job_registry.get("old") is None
     assert job_registry.get("new") is not None
+
+
+def test_sweep_never_reaps_in_flight_jobs():
+    # Two jobs with tiny retention, both in-flight (queued / processing).
+    # Even past their original expires_at, the reaper must leave them alone.
+    _create("a", retention=1.0, now=0.0)   # expires_at = 1.0
+    _create("b", retention=1.0, now=0.0)   # expires_at = 1.0
+    job_registry.mark_processing("b")
+
+    dropped = job_registry.sweep_expired(now=1000.0)
+
+    assert dropped == []
+    assert job_registry.get("a") is not None
+    assert job_registry.get("b") is not None
+
+
+def test_mark_done_restamps_expiry_from_completion():
+    # Created at t=0 with retention=100 → expires_at=100.
+    # mark_done at t=500 → expires_at must be re-stamped to 500+100=600.
+    _create("j1", retention=100.0, now=0.0)
+    job_registry.mark_done("j1", duration_seconds=5.0, concat_strategy="fast", now=500.0)
+    assert job_registry.get("j1").expires_at == 600.0
+
+    # Same for mark_failed.
+    _create("j2", retention=100.0, now=0.0)
+    job_registry.mark_failed("j2", code="render_failed", error="oops", now=700.0)
+    assert job_registry.get("j2").expires_at == 800.0
 
 
 def test_mark_downloaded_shortens_ttl_to_grace_window():

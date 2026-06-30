@@ -93,17 +93,24 @@ async def enqueue_job(
 
     job_id = str(uuid.uuid4())
     workdir = Path(tempfile.mkdtemp(prefix=f"render_{job_id}_"))
+    try:
+        clip_paths: list[Path] = []
+        for role, upload in clips:
+            dest = workdir / f"{role}.mp4"
+            await _persist(upload, dest)
+            clip_paths.append(dest)
 
-    clip_paths: list[Path] = []
-    for role, upload in clips:
-        dest = workdir / f"{role}.mp4"
-        await _persist(upload, dest)
-        clip_paths.append(dest)
-
-    music_path: Path | None = None
-    if music is not None:
-        music_path = workdir / "music"
-        await _persist(music, music_path)
+        music_path: Path | None = None
+        if music is not None:
+            music_path = workdir / "music"
+            await _persist(music, music_path)
+    except Exception as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise RenderError(
+            "Error inesperado al recibir los archivos del render.",
+            code="internal_error",
+            job_id=None,
+        ) from exc
 
     output_path = workdir / f"{params.output_name}.mp4"
 

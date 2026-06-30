@@ -34,6 +34,7 @@ class JobRecord:
     duration_seconds: float | None = None
     concat_strategy: str | None = None
     expires_at: float = 0.0
+    retention_seconds: float = 0.0
 
 
 _lock = threading.Lock()
@@ -62,6 +63,7 @@ def create(
         music_path=music_path,
         params=params,
         expires_at=ts + retention_seconds,
+        retention_seconds=retention_seconds,
     )
     with _lock:
         _jobs[job_id] = rec
@@ -80,7 +82,14 @@ def mark_processing(job_id: str) -> None:
             rec.status = "processing"
 
 
-def mark_done(job_id: str, *, duration_seconds: float, concat_strategy: str) -> None:
+def mark_done(
+    job_id: str,
+    *,
+    duration_seconds: float,
+    concat_strategy: str,
+    now: float | None = None,
+) -> None:
+    ts = time.monotonic() if now is None else now
     with _lock:
         rec = _jobs.get(job_id)
         if rec is not None:
@@ -88,15 +97,24 @@ def mark_done(job_id: str, *, duration_seconds: float, concat_strategy: str) -> 
             rec.code = "ok"
             rec.duration_seconds = duration_seconds
             rec.concat_strategy = concat_strategy
+            rec.expires_at = ts + rec.retention_seconds
 
 
-def mark_failed(job_id: str, *, code: ErrorCode, error: str) -> None:
+def mark_failed(
+    job_id: str,
+    *,
+    code: ErrorCode,
+    error: str,
+    now: float | None = None,
+) -> None:
+    ts = time.monotonic() if now is None else now
     with _lock:
         rec = _jobs.get(job_id)
         if rec is not None:
             rec.status = "failed"
             rec.code = code
             rec.error = error
+            rec.expires_at = ts + rec.retention_seconds
 
 
 def pending_count() -> int:
@@ -115,7 +133,11 @@ def mark_downloaded(job_id: str, *, grace_seconds: float, now: float | None = No
 def sweep_expired(now: float | None = None) -> list[Path]:
     ts = time.monotonic() if now is None else now
     with _lock:
-        expired = [jid for jid, r in _jobs.items() if ts >= r.expires_at]
+        expired = [
+            jid
+            for jid, r in _jobs.items()
+            if r.status in ("done", "failed") and ts >= r.expires_at
+        ]
         workdirs = [_jobs[jid].workdir for jid in expired]
         for jid in expired:
             del _jobs[jid]
