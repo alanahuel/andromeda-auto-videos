@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     orientation_strategy: Literal["crop", "pad"] = "crop"
     log_level: str = "INFO"
 
+    # Async job lifecycle.
+    job_retention_seconds: int = 1800   # reaper purges jobs + workdirs older than this
+    reaper_interval_seconds: int = 60   # how often the reaper sweeps
+    max_pending_jobs: int = 20          # POST /jobs returns 429 too_busy beyond this
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
