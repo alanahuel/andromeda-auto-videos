@@ -121,12 +121,15 @@ async def create_job(
             max_pending=settings.max_pending_jobs,
         )
     except RenderError as exc:
+        headers = {"X-Status-Code": exc.code}
+        if exc.job_id:
+            headers["X-Job-Id"] = exc.job_id
         return JSONResponse(
             status_code=exc.http_status,
             content=ErrorResponse(
                 error=exc.message, code=exc.code, job_id=exc.job_id
             ).model_dump(),
-            headers={"X-Status-Code": exc.code},
+            headers=headers,
         )
 
     background_tasks.add_task(execute_job, job_id)

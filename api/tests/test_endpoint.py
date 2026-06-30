@@ -86,6 +86,7 @@ def test_post_422_when_no_clips_uploaded():
     resp = client.post("/jobs", headers={"X-API-Key": API_KEY}, data={"params": _params()})
     assert resp.status_code == 422
     assert resp.json()["code"] == "invalid_params"
+    assert resp.headers["x-status-code"] == "invalid_params"
 
 
 def test_post_422_on_invalid_params_json():
@@ -97,6 +98,16 @@ def test_post_422_on_invalid_params_json():
 
 def test_post_rejects_missing_api_key():
     resp = client.post("/jobs", data={"params": _params()}, files=_multipart_files())
+    assert resp.status_code == 401
+
+
+def test_post_rejects_wrong_api_key():
+    resp = client.post(
+        "/jobs",
+        headers={"X-API-Key": "nope-nope-nope-nope"},
+        data={"params": _params()},
+        files=_multipart_files(),
+    )
     assert resp.status_code == 401
 
 
@@ -130,12 +141,14 @@ def test_status_then_result_happy_path():
     assert body["code"] == "ok"
     assert body["duration_seconds"] == 42.5
     assert body["concat_strategy"] == "fast"
+    assert s.headers["x-status-code"] == "ok"
 
     r = client.get(f"/jobs/{job_id}/result", headers={"X-API-Key": API_KEY})
     assert r.status_code == 200
     assert r.headers["content-type"] == "video/mp4"
     assert r.headers["x-status-code"] == "ok"
     assert r.headers["x-concat-strategy"] == "fast"
+    assert r.headers["x-output-duration-seconds"] == "42.5"
     assert 'filename="ad_2026_05_test.mp4"' in r.headers["content-disposition"]
     assert r.content == _FAKE_MP4
 
@@ -148,6 +161,10 @@ def test_status_unknown_job_404():
 
 def test_status_requires_api_key():
     assert client.get("/jobs/whatever").status_code == 401
+
+
+def test_result_requires_api_key():
+    assert client.get("/jobs/whatever/result").status_code == 401
 
 
 def test_failed_render_status_and_result():
